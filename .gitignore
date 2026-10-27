@@ -1,0 +1,28 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== AI Pulse 本地密钥与数据 =====
+# 真实密钥只放本地 .env，模板 .env.example 可以提交
+.env
+pulse.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ===== RAG 向量库（可重建） =====
+chroma_db/
+
+# ===== Streamlit =====
+.streamlit/secrets.toml
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.trae/
+.DS_Store
+Thumbs.db

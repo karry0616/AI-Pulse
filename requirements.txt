@@ -1,0 +1,7 @@
+streamlit>=1.49
+plotly>=6.0
+pandas>=2.0
+feedparser>=6.0
+requests>=2.28
+chromadb>=0.5.20
+APScheduler>=3.10,<4
