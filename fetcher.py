@@ -13,6 +13,9 @@ import calendar
 import html
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import date, datetime
 from urllib.parse import quote
 
@@ -23,8 +26,21 @@ import database
 from sources import KEYWORD_ALIASES, SEARCH_TERMS, SOURCES
 
 USER_AGENT = "Mozilla/5.0 (compatible; AI-Pulse/0.1; +https://localhost)"
-TIMEOUT = 10
+TIMEOUT = 5
 SUMMARY_LIMIT = 160
+FETCH_WORKERS = 6           # 数据源并发抓取，最慢的源决定总耗时
+FETCH_BUDGET = 12           # 整轮抓取的时间预算（秒），超预算的源本轮跳过
+CACHE_TTL = 180             # 同一 URL + 关键词 3 分钟内复用结果，避免重复点击反复下载
+FAIL_TTL = 300              # 失败过的源 5 分钟内不再重试，避免每次点击都卡在同一个坏源
+
+_CACHE: dict[tuple[str, str, int], tuple[float, list[dict]]] = {}
+_FAIL_CACHE: dict[tuple[str, str], float] = {}
+
+
+def clear_cache() -> None:
+    _CACHE.clear()
+    _FAIL_CACHE.clear()
+
 
 POSITIVE_WORDS = [
     "launch", "funding", "raises", "breakthrough", "partnership", "record",
@@ -105,6 +121,12 @@ def fetch_source(
     if "{q}" in url:
         url = url.format(q=quote(SEARCH_TERMS.get(keyword, keyword)))
 
+    cache_key = (url, keyword, per_source)
+    cached = _CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < CACHE_TTL:
+        log(f"[CACHE] {name} 命中 {CACHE_TTL}s 缓存 {len(cached[1])} 条，跳过请求")
+        return [dict(item) for item in cached[1]]
+
     resp = None
     for attempt in range(2):  # 公开 RSS 偶发超时，重试一次
         try:
@@ -154,7 +176,38 @@ def fetch_source(
             break
 
     log(f"[OK] {name} 命中 {len(items)} 条「{keyword}」资讯")
+    _CACHE[cache_key] = (time.time(), items)
     return items
+
+
+def _fetch_logical(
+    logical: str,
+    keyword: str,
+    per_source: int,
+    messages: list[str],
+) -> list[dict]:
+    """抓取一个逻辑数据源（含候选源回退），日志先收集、回到主线程再输出。"""
+    failed_at = _FAIL_CACHE.get((logical, keyword))
+    if failed_at and time.time() - failed_at < FAIL_TTL:
+        messages.append(f"[CACHE] {logical} 近 {FAIL_TTL}s 内失败过，本轮跳过")
+        return []
+
+    specs = SOURCES.get(logical)
+    if not specs:
+        messages.append(f"[WARN] {logical} 暂无公开 RSS 源，已跳过")
+        return []
+
+    for label, url in specs:
+        items = fetch_source(label, url, keyword, per_source, messages.append)
+        if items is not None:
+            _FAIL_CACHE.pop((logical, keyword), None)
+            if len(specs) > 1 and label != logical:
+                messages.append(f"[WARN] {logical} 源不可用，已回退至 {label}")
+            return items
+
+    _FAIL_CACHE[(logical, keyword)] = time.time()
+    messages.append(f"[WARN] {logical} 全部候选源抓取失败，已跳过（{FAIL_TTL}s 内不再重试）")
+    return []
 
 
 def fetch_all(
@@ -163,29 +216,44 @@ def fetch_all(
     per_source: int = 8,
     log=print,
 ) -> list[dict]:
-    """遍历数据源，跨源按标题去重后返回。"""
-    all_items: list[dict] = []
-    seen: set[str] = set()
+    """并发抓取所有数据源，按传入顺序跨源去重后返回。
+
+    并发把总耗时从「各源串行累加」压到「最慢单源耗时」，
+    日志仍按数据源顺序输出，避免多线程写 Streamlit 会话状态。
+    """
+    if not sources:
+        return []
+
+    results: dict[str, list[dict]] = {}
+    messages: dict[str, list[str]] = {logical: [] for logical in sources}
+
+    pool = ThreadPoolExecutor(max_workers=min(FETCH_WORKERS, len(sources)))
+    futures = {
+        logical: pool.submit(_fetch_logical, logical, keyword, per_source, messages[logical])
+        for logical in sources
+    }
+    deadline = time.monotonic() + FETCH_BUDGET
+    for logical in sources:
+        try:
+            results[logical] = futures[logical].result(timeout=max(deadline - time.monotonic(), 0))
+        except FutureTimeout:
+            messages[logical] = [f"[WARN] {logical} 超过 {FETCH_BUDGET}s 未返回，本轮跳过"]
+            results[logical] = []
+            _FAIL_CACHE[(logical, keyword)] = time.time()
+        except Exception as exc:  # 单源异常不拖垮整轮抓取
+            messages[logical] = [f"[WARN] {logical} 抓取异常：{type(exc).__name__}"]
+            results[logical] = []
+    # 预算耗尽后不再等待未完成的源，避免卡住整轮更新
+    pool.shutdown(wait=False, cancel_futures=True)
 
     for logical in sources:
-        specs = SOURCES.get(logical)
-        if not specs:
-            log(f"[WARN] {logical} 暂无公开 RSS 源，已跳过")
-            continue
+        for message in messages.get(logical, []):
+            log(message)
 
-        items: list[dict] | None = None
-        for label, url in specs:
-            items = fetch_source(label, url, keyword, per_source, log)
-            if items is not None:
-                if len(specs) > 1 and label != logical:
-                    log(f"[WARN] {logical} 源不可用，已回退至 {label}")
-                break
-
-        if items is None:
-            log(f"[WARN] {logical} 全部候选源抓取失败，已跳过")
-            continue
-
-        for item in items:
+    all_items: list[dict] = []
+    seen: set[str] = set()
+    for logical in sources:
+        for item in results.get(logical, []):
             key = item["title"].lower()
             if key in seen:
                 continue

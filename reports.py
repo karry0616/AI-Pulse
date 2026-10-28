@@ -25,6 +25,8 @@ def render(
 ) -> str:
     usage = usage or {}
     alert_line = f"#{alert_id}（{level}）" if alert_id else "无"
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
 
     return f"""# AI Pulse 日报 · {keyword}
 
@@ -60,7 +62,7 @@ def render(
 ## 成本
 
 - LLM 调用：{usage.get("calls", 0)} 次
-- tokens：{usage.get("total_tokens", 0)}（prompt {usage.get("prompt_tokens", 0)} / completion {usage.get("completion_tokens", 0)}）
+- tokens：{usage.get("total_tokens", 0)}（prompt {prompt_tokens} / completion {completion_tokens}）
 - 调用累计耗时：{usage.get("latency_ms", 0) / 1000:.1f}s
 - 端到端耗时：{(analysis.get("_duration_ms") or 0) / 1000:.1f}s
 """

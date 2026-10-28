@@ -1,8 +1,8 @@
 # AI Pulse 架构与代码库分析报告
 
-> 分析对象：本仓库全部源码（35 个 Python 文件，约 3300 行，含 `ui/` 与 `tests/`；不含 README 与依赖清单）
+> 分析对象：本仓库全部源码（40 个 Python 文件，约 4600 行，含 `ui/` 与 `tests/`；不含 README 与依赖清单）
 > 分析方式：全量源码通读 + 调用链追踪 + 依赖关系核对
-> 更新时间：2026-10-28（P0 / P1 阶段完成并提交后）
+> 更新时间：2026-10-28（P0 / P1 / P2 / P3 阶段完成并自测通过后）
 > 文档用途：既是架构分析，也是**交接文档**。其他 Agent / 开发者读「项目现状速览」+「十、实施进度」即可知道项目做了什么、还没做什么。
 
 ---
@@ -20,15 +20,17 @@
 | `pipeline.py` | 一次 run 的总编排 + 跨进程运行锁 + 热度计算 + 日报导出 | 唯一入口，UI 与调度器都调它 |
 | `fetcher.py` | RSS 抓取、清洗、关键词匹配、规则情感（词边界匹配） | 只抓公开 RSS |
 | `sources.py` | 数据源 / 关键词 / 检索词 / 别名的唯一注册表 | **加源、加关键词只改这里** |
-| `database.py` | SQLite 六张表、`user_version` 迁移、去重、增量过滤、情感回写、事件线 | 所有 SQL 集中在此 |
+| `database.py` | SQLite 九张表、`user_version` 迁移、去重、增量过滤、情感回写、事件线、分析结果回放、归档 | 所有 SQL 集中在此；`--stats` / `--archive-days` CLI |
 | `reports.py` | Markdown 日报渲染与落盘 | 写 `reports/`，已 gitignore |
 | `events.py` | 事件线与实体追踪：多来源同一事件的标题相似度归并 | 纯规则，零 token 成本 |
+| `api.py` | 只读 + 触发类 HTTP API（标准库 `http.server`，10 个端点）+ 飞书卡片回调 | 默认 `127.0.0.1:8502`，与 UI 共用冷却与运行锁 |
+| `logging_setup.py` | 统一日志：控制台 + `logs/pulse.log`（2MB × 3 轮转） | `pipeline` 的 `_tee_log` 双写 UI 与文件 |
 | `agents/` | `state` / `prompts` / `collector` / `analyst` / `critic` / `graph` | 60 行纯代码状态机，不依赖 LangGraph |
 | `llm/client.py` | DeepSeek JSON Mode、token 计量、429/5xx 退避重试 | 每次调用落 `llm_calls` |
 | `rag/store.py` · `rag/memory.py` | Chroma 向量记忆（失败 5 分钟冷却重试）+ 周同比 | 嵌入是字符 n-gram 哈希，离线可跑 |
 | `notify.py` | 钉钉 HMAC 加签 / 飞书卡片推送 | 只在人工审批后调用 |
 | `scheduler_service.py` | APScheduler 每天 08:00，多关键词串行 | 独立进程，复用运行锁 |
-| `tests/` | 63 个 pytest 用例 | CI：`.github/workflows/ci.yml` |
+| `tests/` | 121 个 pytest 用例 | CI：`.github/workflows/ci.yml` |
 
 **一次 run 的实际顺序（当前代码）**
 
@@ -36,7 +38,7 @@
 pipeline.run(keyword, sources, trigger)
   → 获取 .pulse.lock 跨进程锁（30 分钟残留可抢占）
   → 过期预警 expire_stale_alerts(24h)
-  → fetcher.fetch_all()                  串行抓源，单源失败回退/跳过
+  → fetcher.fetch_all()                  6 线程并发抓源 + 12 秒预算 + 结果缓存
   → database.filter_unseen()             计算真正的新条目
   → database.save_items()                (date,title,keyword) 去重入库
   → [无新条目] 回退最近 1 天存档继续分析
@@ -46,6 +48,7 @@ pipeline.run(keyword, sources, trigger)
   → pipeline.compute_heat()              代码计算热度，覆盖模型值
   → database.update_sentiments()         Agent 判定情感回写数据库
   → events.link_run()                    同事件多来源报道归并为事件线（纯规则）
+  → database.save_analysis()             分析结果落库，刷新页面可回放
   → [negative_alerts > 0] save_alert()   只暂存 pending，等待人工审批
   → reports.save()                       写 reports/YYYY-MM-DD-{keyword}.md
   → finish_run()                         回写 run_logs
@@ -53,25 +56,31 @@ pipeline.run(keyword, sources, trigger)
 推送不在本流程内：用户点「审核并发送」后走 pipeline.push_alert()
 ```
 
-**数据层（SQLite，WAL，`user_version=2`）**
+**数据层（SQLite，WAL，`user_version=3`）**
 
 | 表 | 用途 | 关键约束 |
 | --- | --- | --- |
 | `daily_intel` | 抓取到的资讯 | `UNIQUE(date, title, keyword)`；`user_version=1` 由 v0 迁移而来 |
 | `run_logs` | 每次 run 的状态、条数、耗时、错误 | `run_id` 主键 |
 | `llm_calls` | 每次 LLM 调用的 token / 耗时 / 成败 | 按 `run_id + node` 可审计 |
-| `alerts` | 预警与审批状态 | `pending / sent / failed / expired` |
+| `alerts` | 预警与审批状态 | `pending / sent / failed / expired / rejected`；`reviewed_by` / `review_note` 审计字段（v3 新增） |
 | `event_threads` | 事件线：实体、首末日期、报道数 | `thread_key` 唯一（v2 新增） |
 | `event_links` | 事件线 ↔ 资讯明细 | `UNIQUE(thread_id, title)` 防重复计数（v2 新增） |
+| `analyses` | 每次 run 的完整分析快照（JSON） | `run_id` 主键，刷新页面可回放（v3 新增） |
+| `daily_intel_archive` | 超期资讯冷数据 | 与 `daily_intel` 同构（v3 新增） |
+| `llm_calls_archive` | 超期调用记录冷数据 | 与 `llm_calls` 同构（v3 新增） |
 
 **常用命令**
 
 ```powershell
 .\.venv\Scripts\streamlit.exe run app.py                       # 页面
+.\.venv\Scripts\python.exe api.py                             # HTTP API（127.0.0.1:8502）
 .\.venv\Scripts\python.exe pipeline.py --keyword "AI Agent"    # 手动跑一次
 .\.venv\Scripts\python.exe scheduler_service.py --now --keywords "大模型,RAG"
 .\.venv\Scripts\python.exe events.py --keyword "AI Agent"             # 查看事件线
-.\.venv\Scripts\python.exe -m pytest -q                        # 63 个用例
+.\.venv\Scripts\python.exe database.py --stats                        # 各表容量
+.\.venv\Scripts\python.exe database.py --archive-days 90 --dry-run    # 归档演练
+.\.venv\Scripts\python.exe -m pytest -q                        # 121 个用例
 ```
 
 **设计约束（不要违背）**
@@ -370,13 +379,21 @@ pipeline.run(keyword, sources, trigger)                         # pipeline.py
 11. ✅ 增量抓取（`filter_unseen`）
 12. ✅ 日报导出（`reports/*.md`）
 
-### P2 · 战略级（差异化与生态）— ⏳ 进行中（13 已完成）
+### P2 · 战略级（差异化与生态）— ✅ 全部完成（鉴权按需求跳过）
 
 13. ✅ 事件线与实体追踪（标题相似度 + 实体命中归并；事件线表 v2）
-14. ⏳ API / MCP 化
-15. ⏳ 鉴权 + 审计 + Docker / HTTPS 部署
-16. ⏳ 飞书卡片回调审批
-17. ⏳ 数据迁移 + 归档留存
+14. ✅ API 化（`api.py`，标准库 `http.server`，10 个端点；未做 MCP）
+15. ✅ 审计 + Docker / HTTPS 部署（`reviewed_by` / `review_note` 落库；Dockerfile + compose + Caddyfile）；**鉴权按本次需求明确不做**，改为服务仅绑 `127.0.0.1`
+16. ✅ 飞书卡片回调审批（卡片按钮 → `/api/callback/feishu` → `push_alert` / `reject_alert`）
+17. ✅ 数据迁移 + 归档留存（`user_version=3`；`analyses` + 两张归档表；`database.py --stats / --archive-days`）
+
+### P3 · 稳定性与体验收口 — ✅ 全部完成
+
+18. ✅ Prompt 注入防护（`<<<UNTRUSTED_DATA>>>` 边界包裹 + 注入句式屏蔽）
+19. ✅ 密钥治理（掩码展示、缺失项提示，侧边栏只显示 `sk-1…def`）
+20. ✅ 日志文件化（`logging_setup` + `_tee_log` 双写，2MB × 3 轮转）
+21. ✅ 按钮冷却（默认 90s，UI 禁用 + 倒计时；API 返回 429 + `retry_after`）
+22. ✅ 分析结果持久化（`analyses` 表 + 刷新回放，修复「刷新即丢」）
 
 ---
 
@@ -432,24 +449,39 @@ pipeline.run(keyword, sources, trigger)                         # pipeline.py
 | P1-11 | 增量抓取 | ✅ 已完成（`filter_unseen` 只分析新条目，无新增回退近 1 天存档） |
 | P1-12 | 日报导出 | ✅ 已完成（`reports/YYYY-MM-DD-{keyword}.md`，目录已 gitignore） |
 | P2-13 | 事件线与实体追踪 | ✅ 已完成（`events.py` 规则归并；`event_threads` / `event_links` 两表，`user_version=2`；轨迹面板与日报新增事件线段落） |
-| P2 | 14–17 项 | ⏳ 待开始 |
+| P2-14 | API 化 | ✅ 已完成（`api.py`：`/api/health` `/api/status` `/api/keywords` `/api/alerts` `/api/threads` `/api/intel` `/api/runs` `/api/cost` `/api/storage` `/api/run` `/api/approve` `/api/callback/feishu`） |
+| P2-15 | 审计 + 容器化部署 | ✅ 已完成（`alerts.reviewed_by` / `review_note`；`Dockerfile` + `docker-compose.yml`（ui/api/scheduler/caddy）+ `deploy/Caddyfile`）；**鉴权未做，按要求跳过** |
+| P2-16 | 飞书卡片回调审批 | ✅ 已完成（卡片按钮 + `/api/callback/feishu`，兼容 `action.value` 与卡片 2.0 `event.action.value`） |
+| P2-17 | 数据迁移 + 归档 | ✅ 已完成（`user_version=3`；`analyses` / `daily_intel_archive` / `llm_calls_archive`；`--stats` / `--archive-days` CLI） |
+| P3-18 | Prompt 注入防护 | ✅ 已完成（`agents/prompts.py` 边界包裹 + 注入句式清洗） |
+| P3-19 | 密钥治理 | ✅ 已完成（`config.secret_status()` 掩码、`missing_secrets()`、`secret_warnings()`） |
+| P3-20 | 日志文件化 | ✅ 已完成（`logging_setup.py`，`logs/pulse.log` 2MB × 3；`_tee_log` 双写且不重复落盘） |
+| P3-21 | 按钮冷却 | ✅ 已完成（`RUN_COOLDOWN_SECONDS` 默认 90；UI 禁用 + 倒计时；API 429 + `retry_after`） |
+| P3-22 | 分析结果持久化 | ✅ 已完成（`save_analysis` / `load_analysis`，刷新页面回放上次结果） |
 
 ### 10.1 验证记录（2026-10-28）
 
-- `pytest -q`：**63 passed**（critic / fetcher / database / llm client / rag store / pipeline lock / scheduler / reports / sources / events）
+- `pytest -q`：**121 passed**（critic / fetcher / database / llm client / rag store / pipeline lock / scheduler / reports / sources / events / ops / api / prompts）
 - 事件线端到端（36Kr + Solidot + InfoQ）：11 条资讯归并为 11 条事件线，实体识别正常，日报含「事件线追踪」段落
 - `events.py --keyword "AI Agent"`：可读出事件线实体、报道数与首末日期
 - `compileall`：全部源码模块通过
 - 真实端到端 run（arXiv + InfoQ + 36Kr + Solidot）：抓取 14 条、入库 14 条，Critic 一次通过，
   `[GUARD] heat_score` 由代码修正为 1580（模型给 1520），预警落 `pending`，日报文件生成
 - Streamlit 启动：HTTP 200，`import app` 无异常（UI 布局未改动）
-- 真实 `pulse.db`：`PRAGMA user_version = 2`（v1 唯一键迁移 + v2 事件线两表）
+- 真实 `pulse.db`：`PRAGMA user_version = 3`（v1 唯一键 + v2 事件线 + v3 审计与归档）
+- **P2/P3 联调（本轮）**：
+  - `POST /api/run`（`wait=true`）真实跑通：`items=26`、`inserted=3`、`duration_ms=23309`、`mode=deepseek`，事件线 `linked=3 / new=2 / threads=3`，分析落库后 `/api/stats` 中 `analyses=1`
+  - 90 秒内二次 `POST /api/run` 返回 **429** 且带 `retry_after`；`GET /api/status` 返回 `lock: null`、`cooldown_seconds: 90`
+  - `GET /api/health` 200；`logs/pulse.log` 单行落盘无重复
+  - `database.py --stats`：`daily_intel 84 / llm_calls 25 / analyses 1 / run_logs 22 / alerts 5`；`--archive-days 90 --dry-run` 0 条超期（逻辑正常）
+  - Streamlit `AppTest` 无头渲染：`exceptions=0`、`error=0`，侧边栏「审批人」输入框存在，`PUBLIC_BASE_URL` 未配置时给出提示而非报错
 
 ### 10.2 代码状态
 
 - P0 提交：`6ad6348`（并发锁、测试与 CI、UI 拆分、韧性、预警生命周期）
 - P1 提交：`2761520`（数据源注册表、跨关键词归属、情感口径、防幻觉、多关键词调度、增量抓取、日报）
 - P2-13 提交：事件线与实体追踪（`events.py` + 事件线两表 + 轨迹/日报段落）
-- 本地 `master` 较 `origin/master` 领先 3 个提交，**GitHub 推送因本机无法连通 github.com:443 未完成**
-- 除本次文档更新外工作区干净；`pulse.db`、`chroma_db/`、`reports/`、`.env` 均在 `.gitignore` 中
+- P2-14~17 + P3-18~22：本轮工作区改动，**尚未提交**（等对接确认后再 commit）
+- 本地 `master` 较 `origin/master` 领先若干提交，**GitHub 推送因本机无法连通 github.com:443 未完成**
+- `pulse.db`、`chroma_db/`、`reports/`、`logs/`、`data/`、`.env` 均在 `.gitignore` 中
 

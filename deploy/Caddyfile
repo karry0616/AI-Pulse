@@ -1,0 +1,22 @@
+# AI Pulse HTTPS 反向代理配置
+# 用法：把 pulse.example.com 换成自己的域名，DNS 解析到本机后
+#   docker compose --profile https up -d
+# Caddy 会自动申请并续期证书。
+
+pulse.example.com {
+	encode gzip
+
+	# 页面（Streamlit 需要 WebSocket）
+	handle /_stcore/* {
+		reverse_proxy ui:8501
+	}
+
+	# HTTP API 与飞书卡片回调
+	handle /api/* {
+		reverse_proxy api:8502
+	}
+
+	handle {
+		reverse_proxy ui:8501
+	}
+}

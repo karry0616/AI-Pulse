@@ -86,7 +86,7 @@ def run(state: AgentState, log=print) -> dict:
             log=log,
             max_tokens=1400,
         )
-    except (client.LLMUnavailable, client.LLMCallError) as exc:
+    except (client.LLMUnavailableError, client.LLMCallError) as exc:
         return fallback(state, f"{type(exc).__name__}: {exc}", log)
 
     payload = client.extract_json(result.content)

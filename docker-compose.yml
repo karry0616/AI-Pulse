@@ -1,0 +1,76 @@
+services:
+  # 页面：默认只绑本机回环，未做鉴权前不要直接暴露到公网
+  ui:
+    build: .
+    container_name: ai-pulse-ui
+    env_file: .env
+    environment:
+      PULSE_DB_PATH: /data/pulse.db
+      PULSE_LOG_DIR: /data/logs
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - pulse-data:/data
+      - ./reports:/app/reports
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # HTTP API：供外部系统触发 run / 查询情报 / 飞书卡片回调
+  api:
+    build: .
+    container_name: ai-pulse-api
+    command: ["python", "api.py", "--host", "0.0.0.0", "--port", "8502"]
+    env_file: .env
+    environment:
+      PULSE_DB_PATH: /data/pulse.db
+      PULSE_LOG_DIR: /data/logs
+    ports:
+      - "127.0.0.1:8502:8502"
+    volumes:
+      - pulse-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8502/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # 定时任务：默认不拉起（profile: sched），确认 .scheduler.off 已解除后再启动
+  scheduler:
+    build: .
+    container_name: ai-pulse-scheduler
+    command: ["python", "scheduler_service.py"]
+    profiles: ["sched"]
+    env_file: .env
+    environment:
+      PULSE_DB_PATH: /data/pulse.db
+      PULSE_LOG_DIR: /data/logs
+    volumes:
+      - pulse-data:/data
+    restart: unless-stopped
+
+  # HTTPS 反向代理：profile: https，证书由 Caddy 自动申请
+  caddy:
+    image: caddy:2-alpine
+    container_name: ai-pulse-caddy
+    profiles: ["https"]
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - ui
+      - api
+    restart: unless-stopped
+
+volumes:
+  pulse-data:
+  caddy-data:
+  caddy-config:

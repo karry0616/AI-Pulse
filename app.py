@@ -7,7 +7,7 @@
 """
 
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from html import escape
 from pathlib import Path
 
@@ -40,6 +40,17 @@ AMBER = "#FBBF24"
 RED = "#F87171"
 MUTED = "#8B93A7"
 PLOTLY_FONT = "Inter, 'Segoe UI', 'Microsoft YaHei', sans-serif"
+
+
+def section(title: str, caption: str) -> None:
+    """统一的区块标题：左侧色条 + 主标题 + 右侧说明。"""
+    st.markdown(
+        '<div class="sec-head"><span class="sec-bar"></span>'
+        f'<span class="sec-title">{escape(title)}</span>'
+        f'<span class="sec-cap">{escape(caption)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # 2. 数据链路与会话状态
@@ -113,7 +124,7 @@ def run_pipeline(keyword: str, sources: list[str]) -> tuple[str, str]:
                 state="complete",
                 expanded=False,
             )
-        except pipeline.RunLocked as exc:
+        except pipeline.RunLockedError as exc:
             add_log(f"[WARN] {exc}")
             status.update(label="已有任务正在运行", state="error", expanded=True)
             return "已有任务正在运行，请稍后再试", "⏳"
@@ -123,7 +134,11 @@ def run_pipeline(keyword: str, sources: list[str]) -> tuple[str, str]:
             return "情报更新失败，请查看底部日志", "⚠️"
 
     mode = "DeepSeek" if result.analysis["_mode"] == "deepseek" else "本地规则"
-    return f"已更新 {result.items} 条情报（新增 {result.inserted}）· {mode} 分析完成", "⚡"
+    seconds = round(result.duration_ms / 1000, 1)
+    return (
+        f"已更新 {result.items} 条情报（新增 {result.inserted}）· {mode} 分析完成 · 耗时 {seconds}s",
+        "⚡",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +189,17 @@ with st.sidebar:
 
     if not os.getenv("DEEPSEEK_API_KEY"):
         st.caption("⚠️ 未配置 DEEPSEEK_API_KEY，将走本地规则引擎")
-    if not notify.webhook_configured():
-        st.caption("⚠️ 未配置 WEBHOOK_URL，预警审批后无法推送")
+
+    st.markdown('<div class="side-label">审批设置</div>', unsafe_allow_html=True)
+    reviewer = st.text_input(
+        "审批人",
+        value="operator",
+        label_visibility="collapsed",
+        placeholder="审批人署名（写入审计字段）",
+    )
+
+    for warning in config.secret_warnings():
+        st.caption(warning)
 
 # ---------------------------------------------------------------------------
 # 6. 顶部 Header
@@ -189,11 +213,21 @@ with head_left:
         unsafe_allow_html=True,
     )
 
-with head_btn:
-    clicked = st.button("立即更新情报", type="primary", width="stretch")
-
 with head_sel:
     keyword = st.selectbox("监控关键词", KEYWORDS, index=1, label_visibility="collapsed")
+
+# 按钮冷却：同一关键词刚跑过则暂时禁用，避免重复扣费（.env 里 RUN_COOLDOWN_SECONDS=0 可关闭）
+cooldown_left = pipeline.cooldown_remaining(keyword)
+
+with head_btn:
+    clicked = st.button(
+        "立即更新情报",
+        type="primary",
+        width="stretch",
+        disabled=cooldown_left > 0,
+    )
+    if cooldown_left > 0:
+        st.caption(f"冷却中，{cooldown_left}s 后可再次更新")
 
 progress_slot = st.empty()
 st.markdown('<div class="hr-fade"></div>', unsafe_allow_html=True)
@@ -204,7 +238,32 @@ if clicked:
     progress_slot.empty()
     st.toast(toast_text, icon=toast_icon)
 
-# 当前关键词对应的数据分析结果（切换关键词时自动失效）
+# 运行锁看板：有任务占用时给出持有者信息与强制终止入口
+lock_state = pipeline.lock_status()
+if lock_state:
+    holder = (
+        f"pid {lock_state.get('pid', '?')} · {lock_state.get('keyword', '?')} · "
+        f"{lock_state.get('trigger', '?')} · 已持续 {lock_state.get('age_seconds', 0)} 秒"
+    )
+    if lock_state.get("alive"):
+        hint = "任务仍在执行；若确认已卡死可强制终止"
+    else:
+        hint = "持有进程已退出，属于残留锁；点击即可释放"
+    guard_l, guard_r = st.columns([5, 1], vertical_alignment="center")
+    with guard_l:
+        st.warning(f"⚠️ 有任务占用运行锁：{holder}。{hint}")
+    with guard_r:
+        if st.button("强制终止任务", key="force_stop_run", width="stretch"):
+            outcome = pipeline.force_stop(log=add_log)
+            st.toast(outcome["reason"], icon="🛑")
+            st.rerun()
+
+# 当前关键词对应的数据分析结果（切换关键词时优先回放已落库的分析）
+if st.session_state.analysis_keyword != keyword:
+    persisted = database.load_analysis(keyword)
+    st.session_state.analysis = persisted
+    st.session_state.analysis_keyword = keyword if persisted else None
+
 analysis = st.session_state.analysis if st.session_state.analysis_keyword == keyword else None
 snapshot = database.latest_snapshot(keyword)
 trend = database.daily_stats(days=2, keyword=keyword)
@@ -214,11 +273,9 @@ prev_total = int(trend["total"].iloc[0]) if len(trend) >= 2 else 0
 # ---------------------------------------------------------------------------
 # 7. 上部：核心 KPI 看板
 # ---------------------------------------------------------------------------
-st.markdown(
-    '<div class="sec-head"><span class="sec-bar"></span>'
-    '<span class="sec-title">核心 KPI 看板</span>'
-    f'<span class="sec-cap">{date.today().isoformat()} · {st.session_state.last_run or "--:--"} 快照 · SQLite 实时数据</span></div>',
-    unsafe_allow_html=True,
+section(
+    "核心 KPI 看板",
+    f"{date.today().isoformat()} · {st.session_state.last_run or '--:--'} 快照 · SQLite 实时数据",
 )
 
 k1, k2, k3 = st.columns(3, gap="medium")
@@ -255,12 +312,7 @@ with k3:
 # ---------------------------------------------------------------------------
 # 8. 中部：可视化图表
 # ---------------------------------------------------------------------------
-st.markdown(
-    '<div class="sec-head"><span class="sec-bar"></span>'
-    '<span class="sec-title">趋势与情绪可视化</span>'
-    f'<span class="sec-cap">{keyword} · 近 7 天 / 近 3 天</span></div>',
-    unsafe_allow_html=True,
-)
+section("趋势与情绪可视化", f"{keyword} · 近 7 天 / 近 3 天")
 
 stats7 = database.daily_stats(days=7, keyword=keyword)
 
@@ -313,11 +365,9 @@ with chart_right:
 # ---------------------------------------------------------------------------
 # 9. 下部：情报分析与风险预警（7 : 3）
 # ---------------------------------------------------------------------------
-st.markdown(
-    '<div class="sec-head"><span class="sec-bar"></span>'
-    '<span class="sec-title">情报分析与预警</span>'
-    f'<span class="sec-cap">{"LLM 结构化摘要" if analysis else "等待 Agent 生成"} · 自动生成</span></div>',
-    unsafe_allow_html=True,
+section(
+    "情报分析与预警",
+    f"{'LLM 结构化摘要' if analysis else '等待 Agent 生成'} · 自动生成",
 )
 
 if analysis:
@@ -356,8 +406,12 @@ if alert_row:
     alert_level = alert_row.get("level") or alert_level
     alert_body = escape(alert_row["warning_text"]).replace("\n", "<br />")
 
+reviewed_by = (alert_row or {}).get("reviewed_by") or ""
+
 if alert_row and alert_row["status"] == "sent":
-    alert_footer = f"✅ 已推送至 {notify.channel_name()}"
+    alert_footer = f"✅ 已推送至 {notify.channel_name()} · 审批人 {reviewed_by or '未署名'}"
+elif alert_row and alert_row["status"] == "rejected":
+    alert_footer = f"🚫 已驳回 · 审批人 {reviewed_by or '未署名'}"
 elif alert_row and alert_row["status"] == "failed":
     alert_footer = "⚠️ 推送失败，可重新审核发送"
 elif alert_row and alert_row["status"] == "expired":
@@ -403,8 +457,20 @@ with alert_col:
             width="stretch",
         ):
             with st.spinner("正在推送预警…"):
-                push_result = pipeline.push_alert(alert_row["id"], log=add_log)
+                push_result = pipeline.push_alert(
+                    alert_row["id"], log=add_log, reviewed_by=reviewer
+                )
             st.session_state.webhook_ok = push_result.ok
+            st.rerun()
+        if st.button(
+            "驳回本条预警",
+            key=f"reject_alert_{alert_row['id']}",
+            width="stretch",
+        ):
+            outcome = pipeline.reject_alert(
+                alert_row["id"], log=add_log, reviewed_by=reviewer
+            )
+            st.toast(outcome["reason"], icon="✅" if outcome["ok"] else "⚠️")
             st.rerun()
     elif analysis and not alert_row and alert_count == 0:
         if st.button(
@@ -433,12 +499,7 @@ if analysis:
 # ---------------------------------------------------------------------------
 # 10. 底部：数据流转面板（终端黑框）
 # ---------------------------------------------------------------------------
-st.markdown(
-    '<div class="sec-head"><span class="sec-bar"></span>'
-    '<span class="sec-title">数据流转日志</span>'
-    '<span class="sec-cap">pulse-agent · pipeline.log</span></div>',
-    unsafe_allow_html=True,
-)
+section("数据流转日志", "pulse-agent · pipeline.log")
 
 log_rows = "".join(
     f'<div><span class="term-time">[{ts}]</span> '

@@ -46,6 +46,17 @@ def channel_name(url: str | None = None) -> str:
     return "Webhook"
 
 
+def public_base_url() -> str:
+    """公网回调地址（飞书卡片按钮使用）；未配置则卡片不带按钮。"""
+    config.load_env()
+    return os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+
+def callback_ready(url: str | None = None) -> bool:
+    return bool(public_base_url()) and channel_name(url) == "飞书"
+
+
+
 def build_markdown(warning_text: str, keyword: str, heat_score: int | None) -> str:
     heat_line = f"\n\n**舆情热度**：{heat_score}" if heat_score else ""
     return (
@@ -73,12 +84,47 @@ def sign_dingtalk(url: str, secret: str) -> str:
     return f"{url}{joiner}timestamp={timestamp}&sign={sign}"
 
 
-def _payload(target: str, markdown: str) -> dict:
+def _action_block(alert_id: int) -> dict:
+    """飞书卡片底部审批按钮：点击后回调 /api/callback/feishu。"""
+    return {
+        "tag": "action",
+        "actions": [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "通过并推送"},
+                "type": "primary",
+                "value": {"action": "approve", "alert_id": str(alert_id)},
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "驳回"},
+                "type": "danger",
+                "value": {"action": "reject", "alert_id": str(alert_id)},
+            },
+        ],
+    }
+
+
+def _payload(target: str, markdown: str, alert_id: int | None = None) -> dict:
     if "dingtalk" in target.lower():
         return {
             "msgtype": "markdown",
             "markdown": {"title": "AI Pulse 风险预警", "text": markdown},
         }
+
+    elements: list[dict] = [{"tag": "markdown", "content": markdown}]
+    if alert_id and callback_ready(target):
+        elements.append(_action_block(alert_id))
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": (
+                    f"> 点击按钮即可完成审批，回调地址：{public_base_url()}/api/callback/feishu\n"
+                    f"> 预警编号 #{alert_id}"
+                ),
+            }
+        )
+
     # 飞书交互卡片；其他测试端点也按这个格式发送
     return {
         "msg_type": "interactive",
@@ -87,7 +133,7 @@ def _payload(target: str, markdown: str) -> dict:
                 "template": "red",
                 "title": {"tag": "plain_text", "content": "⚠️ AI Pulse 风险预警"},
             },
-            "elements": [{"tag": "markdown", "content": markdown}],
+            "elements": elements,
         },
     }
 
@@ -97,6 +143,7 @@ def send_webhook(
     keyword: str = "AI Agent",
     heat_score: int | None = None,
     url: str | None = None,
+    alert_id: int | None = None,
     log=print,
 ) -> PushResult:
     """把预警推送到 Webhook，返回结果对象。"""
@@ -115,7 +162,7 @@ def send_webhook(
 
     try:
         resp = requests.post(
-            target, json=_payload(target, markdown), timeout=WEBHOOK_TIMEOUT
+            target, json=_payload(target, markdown, alert_id), timeout=WEBHOOK_TIMEOUT
         )
     except requests.RequestException as exc:
         log(f"[WARN] Webhook 推送失败：{type(exc).__name__}")

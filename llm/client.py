@@ -27,7 +27,7 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 BACKOFF_SECONDS = 1.0
 
 
-class LLMUnavailable(RuntimeError):
+class LLMUnavailableError(RuntimeError):
     """未配置 API Key 或网络不可用，调用方应降级。"""
 
 
@@ -67,7 +67,7 @@ def chat(
     config.load_env()
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
-        raise LLMUnavailable("未设置环境变量 DEEPSEEK_API_KEY")
+        raise LLMUnavailableError("未设置环境变量 DEEPSEEK_API_KEY")
 
     payload = {
         "model": MODEL,
@@ -101,7 +101,7 @@ def chat(
             latency_ms = int((time.perf_counter() - started) * 1000)
             database.log_llm_call(run_id, node, MODEL, 0, 0, latency_ms, ok=False,
                                   error=f"{type(exc).__name__} after {attempts} attempts")
-            raise LLMUnavailable(f"DeepSeek 网络异常：{type(exc).__name__}") from exc
+            raise LLMUnavailableError(f"DeepSeek 网络异常：{type(exc).__name__}") from exc
 
         if resp.status_code in RETRY_STATUS and attempt < MAX_RETRIES:
             time.sleep(BACKOFF_SECONDS * (2 ** attempt))
@@ -184,7 +184,7 @@ def main() -> int:
             run_id="self_test",
             log=log,
         )
-    except (LLMUnavailable, LLMCallError) as exc:
+    except (LLMUnavailableError, LLMCallError) as exc:
         log(f"[WARN] {exc}")
         return 1
 

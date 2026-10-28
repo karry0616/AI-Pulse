@@ -50,3 +50,59 @@ def test_fetch_all_skips_source_without_rss():
 def test_keywords_have_search_terms():
     for keyword in fetcher.KEYWORD_ALIASES:
         assert keyword in fetcher.SEARCH_TERMS
+
+
+def test_fetch_source_uses_cache(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(fetcher.requests, "get", lambda *a, **k: calls.append("hit"))
+    fetcher.clear_cache()
+    fetcher._CACHE[("https://x.test/rss", "AI Agent", 5)] = (time.time(), [{"title": "cached"}])
+
+    items = fetcher.fetch_source("X", "https://x.test/rss", "AI Agent", 5, lambda m: None)
+
+    assert items == [{"title": "cached"}]
+    assert calls == []  # 命中缓存不再发请求
+
+
+def test_fetch_all_runs_sources_concurrently(monkeypatch):
+    def slow_fetch(name, url, keyword, per_source, log):
+        time.sleep(0.1)
+        return []
+
+    monkeypatch.setattr(fetcher, "fetch_source", slow_fetch)
+    fetcher.clear_cache()
+    names = list(fetcher.SOURCES)[:6]
+
+    started = time.perf_counter()
+    fetcher.fetch_all(names, "AI Agent", log=lambda m: None)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.4  # 串行至少 0.6s，并发应接近单次耗时
+
+
+def test_fetch_all_preserves_source_order(monkeypatch):
+    def fake_fetch(name, url, keyword, per_source, log):
+        return [{"title": f"{name} 标题", "source": name}]
+
+    monkeypatch.setattr(fetcher, "fetch_source", fake_fetch)
+    fetcher.clear_cache()
+    names = list(fetcher.SOURCES)[:3]
+
+    items = fetcher.fetch_all(names, "AI Agent", log=lambda m: None)
+
+    assert [item["source"] for item in items] == names
+
+
+def test_failed_source_is_skipped_within_cooldown(monkeypatch):
+    calls: list[str] = []
+
+    def fail_fetch(name, url, keyword, per_source, log):
+        calls.append(name)
+        return None
+
+    monkeypatch.setattr(fetcher, "fetch_source", fail_fetch)
+    fetcher.clear_cache()
+
+    assert fetcher.fetch_all(["36Kr"], "AI Agent", log=lambda m: None) == []
+    assert fetcher.fetch_all(["36Kr"], "AI Agent", log=lambda m: None) == []
+    assert len(calls) == 1  # 第二轮走失败冷却，不再发请求

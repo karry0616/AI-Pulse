@@ -75,7 +75,7 @@ def run(state: AgentState, log=print) -> list[dict]:
             log=log,
             max_tokens=1500,
         )
-    except (client.LLMUnavailable, client.LLMCallError) as exc:
+    except (client.LLMUnavailableError, client.LLMCallError) as exc:
         state.events = _fallback_events(state.items)
         state.degraded = True
         log(f"[WARN] Collector 调用失败（{type(exc).__name__}），回退规则提取")

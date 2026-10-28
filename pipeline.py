@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -17,6 +20,7 @@ import config
 import database
 import events
 import fetcher
+import logging_setup
 import notify
 import reports
 from agents import graph
@@ -42,8 +46,56 @@ LOCK_PATH = Path(__file__).resolve().parent / ".pulse.lock"
 LOCK_STALE_SECONDS = 30 * 60  # 超过 30 分钟视为异常残留，可被抢占
 
 
-class RunLocked(RuntimeError):
+class RunLockedError(RuntimeError):
     """已有任务在运行，本次拒绝启动（防止重复扣费与并发写库）。"""
+
+
+DEFAULT_COOLDOWN_SECONDS = 90
+
+
+def cooldown_window() -> int:
+    """按钮冷却窗口（秒）；.env 里 RUN_COOLDOWN_SECONDS=0 可关闭。"""
+    config.load_env()
+    raw = os.getenv("RUN_COOLDOWN_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_COOLDOWN_SECONDS
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return DEFAULT_COOLDOWN_SECONDS
+
+
+def cooldown_remaining(keyword: str, window: int | None = None) -> int:
+    """距上次成功 run 还需等待的秒数；0 表示可立即执行。"""
+    limit = cooldown_window() if window is None else window
+    if limit <= 0:
+        return 0
+
+    row = database.latest_success_run(keyword)
+    finished = (row or {}).get("finished_at")
+    if not finished:
+        return 0
+    try:
+        elapsed = (datetime.now() - datetime.fromisoformat(finished)).total_seconds()
+    except ValueError:
+        return 0
+    return max(int(limit - elapsed), 0)
+
+
+def _tee_log(log):
+    """把同一份日志同时写给调用方（UI 面板 / 测试）与落盘 logger。
+
+    调用方本身已落盘时（如 API 的 _log）直接返回，避免同一行写两遍。
+    """
+    if getattr(log, "writes_file", False):
+        return log
+
+    def emit(message: str) -> None:
+        log(message)
+        logging_setup.log(message)
+
+    emit.writes_file = True
+    return emit
 
 
 def compute_heat(items: list[dict]) -> int:
@@ -62,28 +114,118 @@ def _read_lock() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _lock_is_stale() -> bool:
+def _lock_age() -> float:
     try:
-        age = time.time() - LOCK_PATH.stat().st_mtime
+        return time.time() - LOCK_PATH.stat().st_mtime
     except OSError:
-        return True
-    return age > LOCK_STALE_SECONDS
+        return float("inf")
+
+
+def _lock_is_stale() -> bool:
+    return _lock_age() > LOCK_STALE_SECONDS
+
+
+def pid_alive(pid: int) -> bool:
+    """判断进程是否仍存活（Windows 用 OpenProcess，避免 os.kill 误杀）。"""
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    process_query_limited = 0x1000
+    still_active = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(process_query_limited, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def lock_status() -> dict | None:
+    """当前运行锁的持有者与存活状态；无锁返回 None。"""
+    if not LOCK_PATH.exists():
+        return None
+    holder = _read_lock()
+    pid = holder.get("pid")
+    alive = pid_alive(pid) if isinstance(pid, int) else False
+    return {
+        **holder,
+        "alive": alive,
+        "stale": _lock_is_stale(),
+        "age_seconds": int(max(_lock_age(), 0)),
+        "self": pid == os.getpid(),
+    }
+
+
+def force_stop(log=print) -> dict:
+    """强制终止持有锁的任务并清理锁文件。
+
+    进程已死或超时 → 直接释放；进程仍存活且不是当前进程 → 终止该进程再释放；
+    若正是当前进程（UI 线程内任务）则只能释放锁，无法安全杀掉自身。
+    """
+    status = lock_status()
+    if status is None:
+        return {"released": False, "killed": False, "reason": "当前没有运行中的任务"}
+
+    pid = status.get("pid")
+    killed = False
+    reason = "已释放残留锁"
+
+    if isinstance(pid, int) and pid > 0 and status["alive"] and pid != os.getpid():
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        else:
+            os.kill(pid, signal.SIGTERM)
+        killed = True
+        reason = f"已终止任务进程 pid {pid} 并释放锁"
+    elif status["self"]:
+        reason = "锁由当前页面进程持有：已释放锁，但执行线程无法强制中断，请等待本轮结束"
+
+    try:
+        LOCK_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    log(f"[LOCK] 强制终止：{reason}")
+    return {"released": True, "killed": killed, "pid": pid, "reason": reason}
 
 
 @contextmanager
 def run_lock(keyword: str, trigger: str, log=print):
-    """跨进程互斥：UI 手动、调度器、多个浏览器会话共用一把锁。"""
+    """跨进程互斥：UI 手动、调度器、多个浏览器会话共用一把锁。
+
+    锁文件存在时先看持有进程是否还活着：进程已退出则立即接管，
+    不再等 30 分钟超时，避免「有任务在进行中」但实际没人跑的卡死。
+    """
     for _ in range(2):
         try:
             fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             holder = _read_lock()
-            if not _lock_is_stale():
-                raise RunLocked(
-                    f"已有任务正在运行（pid {holder.get('pid', '?')} · "
-                    f"{holder.get('keyword', '?')} · {holder.get('trigger', '?')}），请稍后重试"
+            pid = holder.get("pid")
+            alive = pid_alive(pid) if isinstance(pid, int) else False
+            if alive and not _lock_is_stale():
+                raise RunLockedError(
+                    f"已有任务正在运行（pid {pid or '?'} · "
+                    f"{holder.get('keyword', '?')} · {holder.get('trigger', '?')}），"
+                    f"可在页面点击「强制终止任务」释放"
                 )
-            log(f"[LOCK] 清理残留锁（pid {holder.get('pid', '?')}）")
+            why = "进程已退出" if not alive else f"超过 {LOCK_STALE_SECONDS // 60} 分钟未更新"
+            log(f"[LOCK] 接管残留锁（pid {pid or '?'} · {why}）")
             try:
                 LOCK_PATH.unlink()
             except FileNotFoundError:
@@ -102,6 +244,9 @@ def run_lock(keyword: str, trigger: str, log=print):
                 ensure_ascii=False,
             )
         log(f"[LOCK] 已获取运行锁（pid {os.getpid()}）")
+        orphans = database.close_orphan_runs()
+        if orphans:
+            log(f"[STATE] 已将 {orphans} 条异常中断的运行记录标记为 failed")
         try:
             yield
         finally:
@@ -112,7 +257,7 @@ def run_lock(keyword: str, trigger: str, log=print):
             log("[LOCK] 运行锁已释放")
         return
 
-    raise RunLocked("锁竞争失败，请稍后重试")
+    raise RunLockedError("锁竞争失败，请稍后重试")
 
 
 def run(
@@ -121,6 +266,7 @@ def run(
     trigger: str = "manual",
     log=print,
 ) -> RunResult:
+    log = _tee_log(log)
     with run_lock(keyword, trigger, log=log):
         return _run_once(keyword, sources, trigger, log)
 
@@ -193,6 +339,12 @@ def _run_once(
 
         analysis["_event_threads"] = events.link_run(analysis_items, analysis, keyword, log=log)
 
+        try:
+            database.save_analysis(run_id, keyword, analysis)
+            log("[STATE] 分析结果已落库，刷新页面仍可回放")
+        except Exception as exc:  # 落库失败不影响本次结果展示
+            log(f"[WARN] 分析结果落库失败：{type(exc).__name__}: {exc}")
+
         alert_id: int | None = None
         level = ""
         if analysis["negative_alerts"] > 0:
@@ -262,8 +414,13 @@ def _run_once(
         raise
 
 
-def push_alert(alert_id: int, log=print) -> notify.PushResult:
-    """人工审核通过后真正推送，并回写审批状态。"""
+def push_alert(
+    alert_id: int,
+    log=print,
+    reviewed_by: str = "operator",
+    review_note: str = "",
+) -> notify.PushResult:
+    """人工审核通过后真正推送，并回写审批状态与审批人审计信息。"""
     alert = database.get_alert(alert_id)
     if not alert:
         log(f"[WARN] 预警 #{alert_id} 不存在，无法推送")
@@ -273,23 +430,56 @@ def push_alert(alert_id: int, log=print) -> notify.PushResult:
         log(f"[HITL] 预警 #{alert_id} 已推送过，跳过重复发送")
         return notify.PushResult(True, notify.channel_name(), "已发送")
 
-    if alert["status"] not in ("pending", "failed"):
+    if alert["status"] not in ("pending", "failed", "rejected"):
         log(f"[HITL] 预警 #{alert_id} 状态为 {alert['status']}，不可推送")
         return notify.PushResult(False, notify.channel_name(), alert["status"])
+
+    if alert["status"] == "rejected":
+        log(f"[HITL] 预警 #{alert_id} 已被驳回，如需再次推送请重新审批")
+        return notify.PushResult(False, notify.channel_name(), "已驳回")
 
     result = notify.send_webhook(
         warning_text=alert["warning_text"],
         keyword=alert["keyword"],
         heat_score=alert["heat_score"],
+        alert_id=alert_id,
         log=log,
     )
     database.mark_alert(
         alert_id,
         "sent" if result.ok else "failed",
         result.detail,
+        reviewed_by=reviewed_by,
+        review_note=review_note,
     )
-    log(f"[HITL] 预警 #{alert_id} 审批完成，状态：{'sent' if result.ok else 'failed'}")
+    log(
+        f"[HITL] 预警 #{alert_id} 审批完成（{reviewed_by or '未署名'}），"
+        f"状态：{'sent' if result.ok else 'failed'}"
+    )
     return result
+
+
+def reject_alert(
+    alert_id: int,
+    log=print,
+    reviewed_by: str = "operator",
+    review_note: str = "",
+) -> dict:
+    """驳回预警：不推送，只留审计记录。"""
+    alert = database.get_alert(alert_id)
+    if not alert:
+        log(f"[WARN] 预警 #{alert_id} 不存在，无法驳回")
+        return {"ok": False, "reason": "预警不存在"}
+
+    if alert["status"] == "sent":
+        log(f"[WARN] 预警 #{alert_id} 已推送，不能再驳回")
+        return {"ok": False, "reason": "已推送，不可驳回"}
+
+    database.mark_alert(
+        alert_id, "rejected", "", reviewed_by=reviewed_by, review_note=review_note
+    )
+    log(f"[HITL] 预警 #{alert_id} 已驳回（{reviewed_by or '未署名'}）")
+    return {"ok": True, "reason": "已驳回", "alert_id": alert_id}
 
 
 def main() -> int:
@@ -297,6 +487,7 @@ def main() -> int:
     parser.add_argument("--keyword", default="AI Agent")
     parser.add_argument("--trigger", default="manual")
     parser.add_argument("--approve", action="store_true", help="审核通过本次暂存的预警")
+    parser.add_argument("--reviewer", default="cli", help="审批人署名（写入审计字段）")
     parser.add_argument("--sources", default="TechCrunch,机器之心,36Kr,HackerNews")
     args = parser.parse_args()
 
@@ -309,7 +500,7 @@ def main() -> int:
     sources = [item.strip() for item in args.sources.split(",") if item.strip()]
     try:
         result = run(args.keyword, sources, trigger=args.trigger, log=log)
-    except RunLocked as exc:
+    except RunLockedError as exc:
         log(f"[WARN] {exc}")
         return 1
 
@@ -317,7 +508,7 @@ def main() -> int:
     log(f"预警任务：{result.alert_id}")
 
     if args.approve and result.alert_id:
-        push_alert(result.alert_id, log=log)
+        push_alert(result.alert_id, log=log, reviewed_by=args.reviewer)
 
     return 0
 

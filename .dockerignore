@@ -1,0 +1,36 @@
+# 构建上下文排除项：镜像里只需要源码与依赖清单
+.git
+.gitignore
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+
+# 本地数据与密钥（通过 .env / volume 注入）
+.env
+.env.local
+pulse.db
+*.db-journal
+*.db-wal
+*.db-shm
+chroma_db
+reports
+logs
+data
+
+# 本地运行态
+.pulse.lock
+.scheduler.off
+.scheduler.pid
+
+# 编辑器与文档
+.vscode
+.idea
+.trae
+.github
+docs
+tests
+*.md

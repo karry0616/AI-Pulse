@@ -5,15 +5,21 @@ app.py / fetcher.py 只通过本模块访问数据库，SQL 不散落到别处�
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
 import re
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
-DB_PATH = Path(__file__).resolve().parent / "pulse.db"
+_ROOT = Path(__file__).resolve().parent
+# 容器部署时用 PULSE_DB_PATH 指向挂载卷；本地默认仍在项目根目录
+DB_PATH = Path(os.getenv("PULSE_DB_PATH") or (_ROOT / "pulse.db"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_intel (
@@ -69,7 +75,9 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_at   TEXT,
     reviewed_at  TEXT,
     sent_at      TEXT,
-    push_result  TEXT
+    push_result  TEXT,
+    reviewed_by  TEXT,
+    review_note  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS event_threads (
@@ -94,6 +102,41 @@ CREATE TABLE IF NOT EXISTS event_links (
     sentiment TEXT,
     created_at TEXT,
     UNIQUE(thread_id, title)
+);
+
+CREATE TABLE IF NOT EXISTS analyses (
+    run_id     TEXT PRIMARY KEY,
+    keyword    TEXT NOT NULL,
+    created_at TEXT,
+    payload    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_intel_archive (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    date         TEXT NOT NULL,
+    keyword      TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    summary      TEXT,
+    sentiment    TEXT,
+    source       TEXT,
+    url          TEXT,
+    fetched_at   TEXT,
+    archived_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS llm_calls_archive (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id            TEXT,
+    node              TEXT NOT NULL,
+    model             TEXT,
+    prompt_tokens     INTEGER DEFAULT 0,
+    completion_tokens INTEGER DEFAULT 0,
+    total_tokens      INTEGER DEFAULT 0,
+    latency_ms        INTEGER DEFAULT 0,
+    ok                INTEGER DEFAULT 1,
+    error             TEXT,
+    created_at        TEXT,
+    archived_at       TEXT
 );
 """
 
@@ -148,6 +191,15 @@ def _migrate_daily_intel_unique(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v3_review_columns(conn: sqlite3.Connection) -> None:
+    """v3：alerts 增加审批人审计字段（老库需 ALTER，新库由 SCHEMA 直接建出）。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+    if "reviewed_by" not in columns:
+        conn.execute("ALTER TABLE alerts ADD COLUMN reviewed_by TEXT")
+    if "review_note" not in columns:
+        conn.execute("ALTER TABLE alerts ADD COLUMN review_note TEXT")
+
+
 def init_db() -> None:
     """建表 + 迁移 + 索引，可重复调用。"""
     with _connect() as conn:
@@ -160,12 +212,17 @@ def init_db() -> None:
         if version < 2:
             # v2 只新增事件线两张表（SCHEMA 已建），无需搬数据
             conn.execute("PRAGMA user_version = 2")
+        if version < 3:
+            # v3：审批审计字段 + 分析结果持久化表 + 归档表（后两张 SCHEMA 已建）
+            _migrate_v3_review_columns(conn)
+            conn.execute("PRAGMA user_version = 3")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_date ON daily_intel(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_keyword ON daily_intel(keyword)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_title ON daily_intel(title)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_run ON llm_calls(run_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_run ON alerts(run_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_status ON alerts(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_analysis_kw ON analyses(keyword, created_at)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_thread_kw_last ON event_threads(keyword, last_date)"
         )
@@ -420,6 +477,22 @@ def finish_run(
         )
 
 
+def close_orphan_runs() -> int:
+    """持锁后仍标记为 running 的记录必然是异常中断，统一收敛为 failed。"""
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE run_logs
+               SET status = 'failed',
+                   error = '进程异常中断，任务未正常结束',
+                   finished_at = ?
+             WHERE status = 'running'
+            """,
+            (_now(),),
+        )
+        return cursor.rowcount
+
+
 def log_llm_call(
     run_id: str,
     node: str,
@@ -575,24 +648,35 @@ def latest_pending_alert(keyword: str | None = None) -> dict | None:
     return dict(row) if row else None
 
 
-def mark_alert(alert_id: int, status: str, push_result: str = "") -> None:
+def mark_alert(
+    alert_id: int,
+    status: str,
+    push_result: str = "",
+    reviewed_by: str = "",
+    review_note: str = "",
+) -> None:
+    """回写审批状态与审计信息：谁、什么时候、以什么理由处理了这条预警。"""
     now = _now()
     with _connect() as conn:
-        if status == "sent":
-            conn.execute(
-                "UPDATE alerts SET status = ?, reviewed_at = ?, sent_at = ?, push_result = ? WHERE id = ?",
-                (status, now, now, push_result, alert_id),
-            )
-        elif status == "failed":
-            conn.execute(
-                "UPDATE alerts SET status = ?, reviewed_at = ?, push_result = ? WHERE id = ?",
-                (status, now, push_result, alert_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE alerts SET status = ?, reviewed_at = ? WHERE id = ?",
-                (status, now, alert_id),
-            )
+        conn.execute(
+            """
+            UPDATE alerts
+               SET status = ?, reviewed_at = ?,
+                   sent_at     = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
+                   push_result = CASE WHEN ? <> '' THEN ? ELSE push_result END,
+                   reviewed_by = CASE WHEN ? <> '' THEN ? ELSE reviewed_by END,
+                   review_note = CASE WHEN ? <> '' THEN ? ELSE review_note END
+             WHERE id = ?
+            """,
+            (
+                status, now,
+                status, now,
+                push_result, push_result,
+                reviewed_by, reviewed_by,
+                review_note, review_note,
+                alert_id,
+            ),
+        )
 
 
 def recent_runs(limit: int = 10) -> list[dict]:
@@ -749,3 +833,159 @@ def thread_timeline(thread_id: int, limit: int = 20) -> list[dict]:
             (thread_id, limit),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# 分析结果持久化（刷新不丢）与数据归档留存
+# ---------------------------------------------------------------------------
+def save_analysis(run_id: str, keyword: str, analysis: dict) -> None:
+    """把一次 run 的结构化分析落库，页面刷新或重启后仍能回放。"""
+    payload = json.dumps(analysis, ensure_ascii=False, default=str)
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO analyses (run_id, keyword, created_at, payload)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET payload = excluded.payload,
+                                              created_at = excluded.created_at
+            """,
+            (run_id, keyword, _now(), payload),
+        )
+
+
+def load_analysis(keyword: str | None = None) -> dict | None:
+    """取指定关键词（不传则全局）最近一次分析结果。"""
+    sql = "SELECT payload FROM analyses"
+    params: list = []
+    if keyword:
+        sql += " WHERE keyword = ?"
+        params.append(keyword)
+    sql += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
+
+    with _connect() as conn:
+        row = conn.execute(sql, params).fetchone()
+    if not row:
+        return None
+    try:
+        data = json.loads(row["payload"])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def latest_success_run(keyword: str) -> dict | None:
+    """该关键词最近一次成功的 run，供按钮冷却判断。"""
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM run_logs
+             WHERE keyword = ? AND status = 'success'
+             ORDER BY COALESCE(finished_at, started_at) DESC
+             LIMIT 1
+            """,
+            (keyword,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def archive_old(days: int = 90, dry_run: bool = False) -> dict:
+    """把超过保留期的资讯与调用记录搬到归档表，再从热表删除。
+
+    热表只留近期数据，页面查询与索引不会被历史数据拖慢；
+    归档表保留全量副本，需要追溯时可按 archived_at 查询。
+    """
+    cutoff_day = (date.today() - timedelta(days=days)).isoformat()
+    cutoff_ts = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    now = _now()
+
+    with _connect() as conn:
+        intel_pending = conn.execute(
+            "SELECT COUNT(*) FROM daily_intel WHERE date < ?", (cutoff_day,)
+        ).fetchone()[0]
+        calls_pending = conn.execute(
+            "SELECT COUNT(*) FROM llm_calls WHERE COALESCE(created_at, '') < ?", (cutoff_ts,)
+        ).fetchone()[0]
+
+        pending = {"intel": int(intel_pending), "llm_calls": int(calls_pending)}
+        if dry_run or not (intel_pending or calls_pending):
+            return {**pending, "cutoff_day": cutoff_day, "cutoff_ts": cutoff_ts,
+                    "dry_run": dry_run}
+
+        conn.execute(
+            """
+            INSERT INTO daily_intel_archive
+                (date, keyword, title, summary, sentiment, source, url, fetched_at, archived_at)
+            SELECT date, keyword, title, summary, sentiment, source, url, fetched_at, ?
+              FROM daily_intel WHERE date < ?
+            """,
+            (now, cutoff_day),
+        )
+        intel_moved = conn.execute(
+            "DELETE FROM daily_intel WHERE date < ?", (cutoff_day,)
+        ).rowcount
+
+        conn.execute(
+            """
+            INSERT INTO llm_calls_archive
+                (run_id, node, model, prompt_tokens, completion_tokens, total_tokens,
+                 latency_ms, ok, error, created_at, archived_at)
+            SELECT run_id, node, model, prompt_tokens, completion_tokens, total_tokens,
+                   latency_ms, ok, error, created_at, ?
+              FROM llm_calls WHERE COALESCE(created_at, '') < ?
+            """,
+            (now, cutoff_ts),
+        )
+        calls_moved = conn.execute(
+            "DELETE FROM llm_calls WHERE COALESCE(created_at, '') < ?", (cutoff_ts,)
+        ).rowcount
+
+    return {
+        "intel": int(intel_moved or 0),
+        "llm_calls": int(calls_moved or 0),
+        "cutoff_day": cutoff_day,
+        "cutoff_ts": cutoff_ts,
+        "dry_run": False,
+    }
+
+
+def storage_stats() -> dict:
+    """热表与归档表的行数，供运维查看。"""
+    with _connect() as conn:
+        def count(table: str) -> int:
+            return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+        return {
+            "daily_intel": count("daily_intel"),
+            "daily_intel_archive": count("daily_intel_archive"),
+            "llm_calls": count("llm_calls"),
+            "llm_calls_archive": count("llm_calls_archive"),
+            "analyses": count("analyses"),
+            "run_logs": count("run_logs"),
+            "alerts": count("alerts"),
+        }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="AI Pulse 数据维护")
+    parser.add_argument(
+        "--archive-days", type=int, default=90,
+        help="超过该天数的数据归档并从热表删除（默认 90 天）",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="只统计，不执行归档")
+    parser.add_argument("--stats", action="store_true", help="查看各表行数")
+    args = parser.parse_args()
+
+    init_db()
+    if args.stats:
+        print(json.dumps(storage_stats(), ensure_ascii=False, indent=2))
+        return 0
+
+    result = archive_old(days=args.archive_days, dry_run=args.dry_run)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not args.dry_run:
+        print(json.dumps(storage_stats(), ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
