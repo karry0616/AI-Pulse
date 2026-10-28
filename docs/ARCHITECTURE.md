@@ -33,23 +33,25 @@
 
 ```
 AI Pulse/
-├── app.py                980 行   Streamlit 页面（CSS 380 行 + 图表 + 轨迹 + HITL）
-├── pipeline.py           154 行   一次 run 的总编排
-├── database.py           365 行   SQLite 四张表 + 全部 SQL
-├── fetcher.py            200 行   RSS 抓取、清洗、关键词匹配、规则情感
-├── notify.py             105 行   钉钉加签 / 飞书卡片 Webhook
-├── scheduler_service.py   65 行   APScheduler 每日 08:00 独立进程
-├── config.py              26 行   自己写的 .env 加载器
-├── agents/               452 行   state / prompts / collector / analyst / critic / graph
+├── app.py                476 行   Streamlit 页面（KPI + 图表 + 轨迹 + HITL）
+├── pipeline.py           323 行   一次 run 的总编排（运行锁 / 增量 / 热度 / 日报）
+├── database.py           591 行   SQLite 四张表 + 迁移 + 全部 SQL
+├── fetcher.py            225 行   RSS 抓取、清洗、关键词匹配、规则情感
+├── sources.py             52 行   数据源 / 关键词 / 别名唯一注册表
+├── reports.py             90 行   Markdown 日报导出
+├── notify.py             137 行   钉钉加签 / 飞书卡片 Webhook
+├── scheduler_service.py  110 行   APScheduler 每日 08:00 独立进程
+├── config.py              33 行   自己写的 .env 加载器
+├── agents/               485 行   state / prompts / collector / analyst / critic / graph
 ├── llm/client.py         148 行   DeepSeek JSON Mode + token 计量
 ├── rag/store.py          227 行   Chroma 向量库 + 关键词降级检索
 ├── rag/memory.py          48 行   历史召回上下文 + 周同比
 ├── docs/                         本目录：架构与迭代文档
-├── README.md              90 行
+├── README.md             124 行
 └── requirements.txt        7 行
 ```
 
-体量分布很说明问题：**`app.py` 占了全部代码的 35%**，其中 380 行是 CSS 字符串。这既是优点（UI 好看），也是最大的维护负担。
+体量分布：`app.py` 从 980 行压到 476 行（CSS / 图表 / 轨迹已拆到 `ui/`），新增的 `sources.py` 与 `reports.py` 各自职责单一。
 
 ### 2.2 技术选型与评价
 
@@ -114,18 +116,21 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 | # | 能力 | 实现位置 | 成熟度 | 说明 |
 | --- | --- | --- | --- | --- |
-| 1 | 多源 RSS 采集 | `fetcher.py` `SOURCES` | ●●●●○ | 4 个逻辑源、单源重试 1 次、机器之心失效自动回退量子位 |
-| 2 | 关键词中英双语匹配 | `fetcher.py` `KEYWORD_ALIASES` | ●●●●○ | "AI Agent" 能同时命中 `agentic` / `智能体` |
-| 3 | 入库与去重 | `database.py` `save_items()` | ●●●●○ | `(date, title)` 唯一 + WAL + 5 个索引 |
+| 1 | 多源 RSS 采集 | `sources.py` `SOURCES` · `fetcher.py` | ●●●●○ | 7 个逻辑源（新增 arXiv / InfoQ / Solidot）、单源重试 1 次、机器之心失效自动回退量子位 |
+| 2 | 关键词中英双语匹配 | `sources.py` `KEYWORD_ALIASES` | ●●●●○ | "AI Agent" 能同时命中 `agentic` / `智能体` |
+| 3 | 入库与去重 | `database.py` `save_items()` | ●●●●○ | `(date, title, keyword)` 唯一 + WAL + 索引，跨关键词归属不再丢失 |
 | 4 | 向量记忆 + 降级检索 | `rag/store.py` `query_similar()` | ●●●○○ | 双层降级：Chroma 挂了退 Jaccard 字符二元组 |
 | 5 | 周同比 | `rag/memory.py` `_week_over_week()` | ●●○○○ | 思路对（代码算、模型只能引用），但口径脆弱 |
 | 6 | 三 Agent 状态机 | `agents/graph.py` `run()` | ●●●●○ | 60 行实现 State / Node / 回边，替代 LangGraph |
-| 7 | 契约校验 + Reflexion | `agents/critic.py` `check_contract()` | ●●●●○ | 8 类打回规则，最多 3 次，超限规则降级 |
+| 7 | 契约校验 + Reflexion | `agents/critic.py` `check_contract()` | ●●●●○ | 9 类打回规则（含 top_news 标题可核验），最多 3 次，超限规则降级 |
 | 8 | 全链路降级 | analyst / collector / store 三处 | ●●●●● | 无 Key / 网络挂 / JSON 坏 / 向量挂，页面都不白屏 |
 | 9 | 成本可观测 | `llm/client.py` `chat()` | ●●●●○ | 每次调用按 `run_id` 落 `llm_calls`，轨迹面板可查 |
 | 10 | HITL 审批闸门 | `pipeline.push_alert()` + `app.py` | ●●●●○ | `pending / sent / failed` 三态，失败可重发 |
-| 11 | 定时任务 | `scheduler_service.py` | ●●●○○ | 独立进程、`max_instances=1`、`coalesce` + 1h 补跑 |
+| 11 | 定时任务 | `scheduler_service.py` | ●●●●○ | 独立进程、`max_instances=1`、`coalesce` + 1h 补跑、多关键词串行 |
 | 12 | 双渠道推送 | `notify.py` | ●●●○○ | 钉钉 HMAC 加签 + 飞书交互卡片，自动识别渠道 |
+| 13 | 增量抓取 | `database.filter_unseen()` | ●●●●○ | 只把新条目送 LLM/RAG，无新增才回退近 1 天存档 |
+| 14 | 热度代码化 | `pipeline.compute_heat()` | ●●●●○ | 由条数 + 源数计算，覆盖模型自报值，杜绝随口报数 |
+| 15 | 日报导出 | `reports.py` | ●●●●○ | 每次 run 写 `reports/YYYY-MM-DD-{keyword}.md`（不入库） |
 
 ---
 
@@ -149,6 +154,8 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 ### P0 —— 会直接出事
 
+> 状态（2026-10-28）：A1 / A3 / A4 已修复；A2（鉴权）仍未处理。
+
 | 编号 | 问题 | 现象与影响 | 证据 | 修复方向 |
 | --- | --- | --- | --- | --- |
 | A1 | **没有并发锁** | 手动点按钮 + 定时任务 + 两个浏览器会话，可以同时跑同一个 keyword：重复扣 token、SQLite 写竞争、Chroma upsert 打架、`alerts` 重复生成 | `pipeline.run()` 全程无锁；scheduler 的 `max_instances=1` 只约束它自己 | 文件锁 + 「同 keyword 冷却 N 分钟」 |
@@ -157,6 +164,8 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 | A4 | **app.py 是上帝文件** | 980 行里 380 行 CSS、2 个图表函数、轨迹面板、侧边栏、主布局、HITL 按钮全挤在一起；而且 Streamlit 热重载不刷新被依赖模块，改图表必须重启进程 | `app.py` 全文 | 拆成 `ui/style.css` + `ui/charts.py` + `ui/trace.py`（视觉零改动） |
 
 ### P1 —— 影响正确性与数据质量
+
+> 状态（2026-10-28）：B1 / B2 / B5 / B7 已在 P1 阶段修复；B3 / B4 / B6 已在 P0 阶段修复；B8 / B9 / B10 仍未处理。
 
 | 编号 | 问题 | 现象与影响 | 证据 |
 | --- | --- | --- | --- |
@@ -173,7 +182,7 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 ### P2 —— 生产化才有意义
 
-- **无数据迁移体系**：改表结构只能手工 `ALTER`，schema 没有版本号
+- **数据迁移体系**：已引入 `PRAGMA user_version` 与 v1 一次性迁移，后续改表仍需手写迁移脚本
 - **无留存策略**：`daily_intel`、`llm_calls` 只增不减
 - **日志只打 stdout**：20 条会话日志，刷新就没；没有文件日志与轮转
 - **Prompt 注入**：RSS 标题 / 摘要原样进 Prompt，恶意标题可诱导模型偏离契约
@@ -304,10 +313,16 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 | 阶段 | 项目 | 状态 |
 | --- | --- | --- |
 | P0-1 | 并发锁 | ✅ 已完成（`pipeline.run_lock`，30 分钟残留锁可抢占） |
-| P0-2 | pytest 骨架 + CI | ✅ 已完成（38 个用例，`.github/workflows/ci.yml`） |
+| P0-2 | pytest 骨架 + CI | ✅ 已完成（58 个用例，`.github/workflows/ci.yml`） |
 | P0-3 | 拆分 app.py | ✅ 已完成（`ui/style.css` · `ui/charts.py` · `ui/trace.py`，视觉零改动） |
 | P0-4 | Chroma 降级可恢复 + LLM 重试 | ✅ 已完成（5 分钟冷却重试；429/5xx 两次退避重试） |
 | P0-5 | 预警去重 + 过期状态 | ✅ 已完成（同日同关键词复用；24 小时未审核自动 `expired`） |
-| P1 | 6–12 项 | ⏳ 待开始 |
+| P1-6 | 数据源注册表 + 新增源 | ✅ 已完成（`sources.py` 唯一注册表；新增 arXiv / InfoQ / Solidot，移除抓不到的 Twitter/X） |
+| P1-7 | 跨关键词归属修复 | ✅ 已完成（唯一键改为 `(date, title, keyword)`，`PRAGMA user_version` 一次性迁移） |
+| P1-8 | 情感口径统一 | ✅ 已完成（Agent 判定回写 `daily_intel`；英文词按词边界匹配） |
+| P1-9 | 防幻觉补丁 | ✅ 已完成（`compute_heat` 覆盖模型热度；Critic 增加 top_news 标题可核验） |
+| P1-10 | 多关键词调度 | ✅ 已完成（`--keywords` 逗号列表，默认全部关键词串行执行） |
+| P1-11 | 增量抓取 | ✅ 已完成（`filter_unseen` 只分析新条目，无新增回退近 1 天存档） |
+| P1-12 | 日报导出 | ✅ 已完成（`reports/YYYY-MM-DD-{keyword}.md`，目录已 gitignore） |
 | P2 | 13–17 项 | ⏳ 待开始 |
 

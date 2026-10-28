@@ -1,5 +1,6 @@
 """SQLite 持久层测试：全部走临时库，不触碰真实 pulse.db。"""
 
+import sqlite3
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -31,6 +32,70 @@ def test_save_items_deduplicates_by_date_and_title():
     items = [make_item("新闻A"), make_item("新闻B")]
     assert database.save_items(items) == 2
     assert database.save_items(items) == 0
+
+
+def test_same_title_different_keyword_inserted_twice():
+    assert database.save_items([make_item("同一标题", "AI Agent"), make_item("同一标题", "RAG")]) == 2
+    assert database.save_items([make_item("同一标题", "RAG")]) == 0
+
+
+def test_migration_widens_legacy_unique_key(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript(
+        """
+        CREATE TABLE daily_intel (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            date       TEXT NOT NULL,
+            keyword    TEXT NOT NULL,
+            title      TEXT NOT NULL,
+            summary    TEXT,
+            sentiment  TEXT,
+            source     TEXT,
+            url        TEXT,
+            fetched_at TEXT,
+            UNIQUE(date, title)
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO daily_intel (date, keyword, title) VALUES (?, ?, ?)",
+        (date.today().isoformat(), "AI Agent", "同一标题"),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(database, "DB_PATH", legacy)
+    database.init_db()
+
+    # 旧库里同标题只保留了一条，迁移后可再写入其他关键词
+    assert database.save_items([make_item("同一标题", "大模型")]) == 1
+    with database._connect() as c:
+        assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_filter_unseen_returns_only_new_items():
+    database.save_items([make_item("标题A", "AI Agent")])
+    fresh = database.filter_unseen(
+        [
+            make_item("标题A", "AI Agent"),
+            make_item("标题B", "AI Agent"),
+            make_item("标题A", "RAG"),
+        ]
+    )
+    assert [item["title"] for item in fresh] == ["标题B", "标题A"]
+
+
+def test_update_sentiments_rewrites_matching_rows():
+    database.save_items([make_item("标题A", "AI Agent", "neutral")])
+    assert database.update_sentiments([{"title": "标题A", "sentiment": "negative"}], "AI Agent") == 1
+    df = database.fetch_recent(days=1, keyword="AI Agent")
+    assert df.iloc[0]["sentiment"] == "negative"
+
+
+def test_update_sentiments_ignores_unknown_titles():
+    database.save_items([make_item("标题A", "AI Agent")])
+    assert database.update_sentiments([{"title": "不存在", "sentiment": "positive"}], "AI Agent") == 0
 
 
 def test_fetch_recent_filters_by_keyword():

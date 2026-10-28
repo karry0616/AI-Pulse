@@ -5,6 +5,7 @@ app.py / fetcher.py 只通过本模块访问数据库，SQL 不散落到别处�
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -25,7 +26,7 @@ CREATE TABLE IF NOT EXISTS daily_intel (
     source     TEXT,
     url        TEXT,
     fetched_at TEXT,
-    UNIQUE(date, title)
+    UNIQUE(date, title, keyword)
 );
 
 CREATE TABLE IF NOT EXISTS run_logs (
@@ -84,20 +85,64 @@ def _connect():
         conn.close()
 
 
+def _migrate_daily_intel_unique(conn: sqlite3.Connection) -> None:
+    """v1：唯一键由 (date, title) 扩为 (date, title, keyword)。
+
+    同一条新闻可能同时命中多个关键词，旧唯一键会让后写入的关键词丢失。
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_intel'"
+    ).fetchone()
+    if not row or not row[0]:
+        return
+
+    normalized = "".join(row[0].split()).lower()
+    if "unique(date,title,keyword)" in normalized:
+        return
+
+    conn.executescript(
+        """
+        CREATE TABLE daily_intel_v1 (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            date       TEXT NOT NULL,
+            keyword    TEXT NOT NULL,
+            title      TEXT NOT NULL,
+            summary    TEXT,
+            sentiment  TEXT,
+            source     TEXT,
+            url        TEXT,
+            fetched_at TEXT,
+            UNIQUE(date, title, keyword)
+        );
+        INSERT OR IGNORE INTO daily_intel_v1
+            (id, date, keyword, title, summary, sentiment, source, url, fetched_at)
+        SELECT id, date, keyword, title, summary, sentiment, source, url, fetched_at
+          FROM daily_intel;
+        DROP TABLE daily_intel;
+        ALTER TABLE daily_intel_v1 RENAME TO daily_intel;
+        """
+    )
+
+
 def init_db() -> None:
-    """建表 + 索引，可重复调用。"""
+    """建表 + 迁移 + 索引，可重复调用。"""
     with _connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
+            _migrate_daily_intel_unique(conn)
+            conn.execute("PRAGMA user_version = 1")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_date ON daily_intel(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_keyword ON daily_intel(keyword)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_title ON daily_intel(title)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_run ON llm_calls(run_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_run ON alerts(run_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_status ON alerts(status)")
 
 
 def save_items(items: list[dict]) -> int:
-    """批量写入，按 (date, title) 去重，返回实际新增条数。"""
+    """批量写入，按 (date, title, keyword) 去重，返回实际新增条数。"""
     if not items:
         return 0
 
@@ -127,6 +172,82 @@ def save_items(items: list[dict]) -> int:
             """,
             rows,
         )
+        return conn.total_changes - before
+
+
+def filter_unseen(items: list[dict]) -> list[dict]:
+    """只保留尚未入库的条目（按 date + title + keyword 判定），保持原顺序。"""
+    if not items:
+        return []
+
+    days = {item.get("date") or date.today().isoformat() for item in items}
+    placeholders = ",".join("?" for _ in days)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT date, keyword, title FROM daily_intel WHERE date IN ({placeholders})",
+            list(days),
+        ).fetchall()
+
+    seen = {(row["date"], row["keyword"], row["title"]) for row in rows}
+    fresh: list[dict] = []
+    for item in items:
+        title = item.get("title") or ""
+        if not title:
+            continue
+        key = (item.get("date") or date.today().isoformat(), item.get("keyword") or "", title)
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh.append(item)
+    return fresh
+
+
+def _norm_title(text: str) -> str:
+    """去空白与标点、统一大小写，用于跨来源标题对齐。"""
+    return re.sub(r"[^\w]+", "", str(text or "")).lower()
+
+
+def update_sentiments(events: list[dict], keyword: str) -> int:
+    """用 Agent 判定的事件情感回写同关键词资讯，返回实际更新的行数。
+
+    Agent 只返回标题与情感，标题可能被轻微改写，因此按标题包含关系对齐。
+    """
+    updates: list[tuple[str, int]] = []
+    for event in events or []:
+        sentiment = str(event.get("sentiment") or "").lower()
+        title = _norm_title(event.get("title"))
+        if sentiment not in ("positive", "neutral", "negative") or not title:
+            continue
+        updates.append((sentiment, title))
+    if not updates:
+        return 0
+
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, title FROM daily_intel WHERE keyword = ?", (keyword,)
+        ).fetchall()
+        lookup = {_norm_title(row["title"]): row["id"] for row in rows}
+
+        pairs: list[tuple[str, int]] = []
+        for sentiment, title in updates:
+            row_id = lookup.get(title)
+            if row_id is None:
+                row_id = next(
+                    (
+                        candidate_id
+                        for candidate, candidate_id in lookup.items()
+                        if candidate and (title in candidate or candidate in title)
+                    ),
+                    None,
+                )
+            if row_id is not None:
+                pairs.append((sentiment, row_id))
+
+        if not pairs:
+            return 0
+
+        before = conn.total_changes
+        conn.executemany("UPDATE daily_intel SET sentiment = ? WHERE id = ?", pairs)
         return conn.total_changes - before
 
 

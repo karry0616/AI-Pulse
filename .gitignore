@@ -19,6 +19,9 @@ pulse.db
 # ===== RAG 向量库（可重建） =====
 chroma_db/
 
+# ===== 每日导出报告（可重新生成） =====
+reports/
+
 # ===== Streamlit =====
 .streamlit/secrets.toml
 

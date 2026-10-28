@@ -27,6 +27,13 @@ def test_guess_sentiment_by_word_list():
     assert fetcher.guess_sentiment("A normal product update") == "neutral"
 
 
+def test_guess_sentiment_uses_word_boundary():
+    # risk-free 里的 risk 不应被算作负面词
+    assert fetcher.guess_sentiment("discussing the risk-free rate") == "neutral"
+    # 复数形式仍应命中
+    assert fetcher.guess_sentiment("startup announces layoffs") == "negative"
+
+
 def test_entry_date_falls_back_to_today():
     assert fetcher.entry_date({}) == date.today().isoformat()
 

@@ -17,6 +17,7 @@ import config
 import database
 import fetcher
 import notify
+import reports
 from agents import graph
 from rag import memory as rag_memory
 from rag import store as rag_store
@@ -42,6 +43,14 @@ LOCK_STALE_SECONDS = 30 * 60  # 超过 30 分钟视为异常残留，可被抢�
 
 class RunLocked(RuntimeError):
     """已有任务在运行，本次拒绝启动（防止重复扣费与并发写库）。"""
+
+
+def compute_heat(items: list[dict]) -> int:
+    """由资讯条数与命中源数计算热度（800-2000），不采信模型自报数值。"""
+    sources = {str(item.get("source") or "") for item in items}
+    sources.discard("")
+    heat = 800 + 50 * min(len(items), 20) + 40 * min(len(sources), 5)
+    return max(800, min(2000, heat))
 
 
 def _read_lock() -> dict:
@@ -133,19 +142,26 @@ def _run_once(
     try:
         log(f"Agent 正在从 {len(sources)} 个数据源抓取最新资讯...")
         items = fetcher.fetch_all(sources, keyword, per_source=10, log=log)
+        fresh = database.filter_unseen(items)
         inserted = database.save_items(items)
         log(f"数据清洗完成，过滤 {max(len(items) - inserted, 0)} 条重复/冗余数据。")
 
-        if not items:
+        if len(items) > len(fresh):
+            log(f"[INCR] 跳过 {len(items) - len(fresh)} 条已入库资讯，仅分析新增内容")
+
+        analysis_items = fresh
+        if not analysis_items:
             log("[WARN] 本次未抓取到新资讯，使用最近存档继续分析")
             df = database.fetch_recent(days=1, keyword=keyword)
-            items = df.to_dict("records") if not df.empty else []
+            analysis_items = df.to_dict("records") if not df.empty else []
+            if not analysis_items:
+                analysis_items = items
 
         if rag_store.count() == 0:
             rag_store.backfill(days=7, log=log)
         rag_store.index_items(items, log=log)
 
-        titles = [str(item.get("title") or "") for item in items if item.get("title")]
+        titles = [str(item.get("title") or "") for item in analysis_items if item.get("title")]
         if not titles:
             df = database.fetch_recent(days=7, keyword=keyword)
             titles = df["title"].tolist() if not df.empty else []
@@ -153,7 +169,16 @@ def _run_once(
         memory = rag_memory.build_context(keyword, titles, log=log)
 
         log(f"调用多 Agent 提取结构化特征（输入 {len(titles)} 条标题）...")
-        analysis = graph.run(items, keyword, memory, run_id=run_id, log=log)
+        analysis = graph.run(analysis_items, keyword, memory, run_id=run_id, log=log)
+
+        model_heat = analysis.get("heat_score")
+        analysis["heat_score"] = compute_heat(analysis_items)
+        if model_heat != analysis["heat_score"]:
+            log(
+                f"[GUARD] heat_score 以代码计算为准：{analysis['heat_score']}"
+                f"（模型值 {model_heat}）"
+            )
+
         analysis["_rag"] = {
             "similar": memory.similar[:6],
             "comparison": memory.comparison,
@@ -161,7 +186,12 @@ def _run_once(
         }
         analysis["_duration_ms"] = int((time.perf_counter() - started) * 1000)
 
+        updated = database.update_sentiments(analysis.get("_events_detail") or [], keyword)
+        if updated:
+            log(f"[SENTIMENT] 已用 Agent 判定回写 {updated} 条资讯情感")
+
         alert_id: int | None = None
+        level = ""
         if analysis["negative_alerts"] > 0:
             level = "HIGH" if analysis["negative_alerts"] >= 2 else "MEDIUM"
             alert_id = database.save_alert(
@@ -183,6 +213,22 @@ def _run_once(
             )
 
         duration_ms = int((time.perf_counter() - started) * 1000)
+
+        try:
+            report_path = reports.save(
+                analysis,
+                keyword,
+                run_id,
+                items=len(items),
+                inserted=inserted,
+                usage=usage,
+                alert_id=alert_id,
+                level=level,
+            )
+            log(f"[REPORT] 已导出日报：{report_path.name}")
+        except OSError as exc:
+            log(f"[WARN] 日报导出失败：{type(exc).__name__}: {exc}")
+
         database.finish_run(
             run_id,
             status="success",

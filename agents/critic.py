@@ -19,6 +19,30 @@ REQUIRED_KEYS = (
 
 RATIO_RE = re.compile(r"^(\d+(?:\.\d+)?)%$")
 MATURITY_HEADER = "| 方向 | 成熟度 | 阶段判断 |"
+BULLET_RE = re.compile(r"^\s*-\s*\*\*(.+?)\*\*")
+
+
+def _normalize(text: str) -> str:
+    """去掉空白与标点，统一大小写，便于标题核对。"""
+    return re.sub(r"[^\w]+", "", str(text or "")).lower()
+
+
+def _matches_input_title(head: str, titles: list[str]) -> bool:
+    """短标题需能在输入标题里找到（包含关系或字符重合度 ≥ 0.6）。"""
+    normalized = _normalize(head)
+    if len(normalized) < 2:
+        return False
+
+    for title in titles:
+        candidate = _normalize(title)
+        if not candidate:
+            continue
+        if normalized in candidate or candidate in normalized:
+            return True
+        overlap = len(set(normalized) & set(candidate)) / len(set(normalized))
+        if overlap >= 0.6:
+            return True
+    return False
 
 
 def _as_int(value) -> int | None:
@@ -61,6 +85,16 @@ def check_contract(draft: dict | None, state: AgentState) -> list[str]:
     bullets = [line for line in top_news.splitlines() if line.strip().startswith("- ")]
     if len(bullets) < 3:
         issues.append(f"top_news 至少需要 3 条 `- ` 列表，实际 {len(bullets)} 条")
+    else:
+        verified = 0
+        for line in bullets:
+            match = BULLET_RE.match(line)
+            if match and _matches_input_title(match.group(1), state.titles):
+                verified += 1
+        if verified < 3:
+            issues.append(
+                f"top_news 至少 3 条短标题需来自输入标题原文，实际可核验 {verified} 条"
+            )
 
     maturity = str(draft.get("maturity") or "")
     rows = [line for line in maturity.splitlines() if line.strip().startswith("|")]
@@ -114,5 +148,9 @@ def finalize(state: AgentState) -> dict:
         "_passed": state.passed,
         "_issues": list(last_issues),
         "_events": len(state.events),
+        "_events_detail": [
+            {"title": event.get("title", ""), "sentiment": event.get("sentiment", "neutral")}
+            for event in state.events
+        ],
         "_run_id": state.run_id,
     }

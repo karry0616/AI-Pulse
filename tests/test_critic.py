@@ -8,7 +8,7 @@ from rag.memory import MemoryContext
 
 
 def make_state(items=None):
-    items = items if items is not None else [{"title": f"新闻{i}"} for i in range(5)]
+    items = items if items is not None else [{"title": f"OpenAI 发布第{i}代模型"} for i in range(5)]
     return AgentState(
         run_id="test",
         keyword="AI Agent",
@@ -22,7 +22,11 @@ def valid_draft():
         "heat_score": 1200,
         "positive_ratio": "65%",
         "negative_alerts": 2,
-        "top_news": "- **A**：a\n- **B**：b\n- **C**：c",
+        "top_news": (
+            "- **OpenAI 发布第0代模型**：a\n"
+            "- **OpenAI 发布第1代模型**：b\n"
+            "- **OpenAI 发布第2代模型**：c"
+        ),
         "maturity": (
             "| 方向 | 成熟度 | 阶段判断 |\n"
             "| :--- | :--- | :--- |\n"
@@ -63,6 +67,19 @@ def test_rejects_bad_json_shapes():
     assert critic.check_contract({"_raw": "not json"}, make_state()) == [
         "输出无法解析为合法 JSON"
     ]
+
+
+def test_rejects_fabricated_top_news_titles():
+    draft = valid_draft()
+    draft["top_news"] = "- **某公司发布超级模型**：a\n- **另一家公司融资十亿**：b\n- **行业迎来重大突破**：c"
+    issues = critic.check_contract(draft, make_state())
+    assert any("可核验" in issue for issue in issues)
+
+
+def test_accepts_top_news_matching_input_titles():
+    draft = valid_draft()
+    draft["top_news"] = "- **OpenAI 发布第0代模型**：a\n- **OpenAI 发布第3代模型**：b\n- **OpenAI 发布第4代模型**：c"
+    assert critic.check_contract(draft, make_state()) == []
 
 
 def test_finalize_clamps_out_of_range_values():

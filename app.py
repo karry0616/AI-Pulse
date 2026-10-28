@@ -18,6 +18,7 @@ import config
 import database
 import notify
 import pipeline
+from sources import DATA_SOURCES, KEYWORDS
 from ui import charts, trace
 
 config.load_env()
@@ -43,9 +44,6 @@ PLOTLY_FONT = "Inter, 'Segoe UI', 'Microsoft YaHei', sans-serif"
 # ---------------------------------------------------------------------------
 # 2. 数据链路与会话状态
 # ---------------------------------------------------------------------------
-KEYWORDS = ["大模型", "AI Agent", "具身智能", "RAG"]
-DATA_SOURCES = ["TechCrunch", "机器之心", "36Kr", "HackerNews", "Twitter/X"]
-
 database.init_db()
 
 if "logs" not in st.session_state:

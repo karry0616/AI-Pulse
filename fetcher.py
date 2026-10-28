@@ -20,47 +20,11 @@ import feedparser
 import requests
 
 import database
+from sources import KEYWORD_ALIASES, SEARCH_TERMS, SOURCES
 
 USER_AGENT = "Mozilla/5.0 (compatible; AI-Pulse/0.1; +https://localhost)"
 TIMEOUT = 10
 SUMMARY_LIMIT = 160
-
-# 逻辑数据源 → [(实际展示源名, RSS 地址)]，按顺序尝试，失败自动回退
-# 注：机器之心官方 RSS 已失效（返回 HTML），回退到量子位；Twitter/X 无公开 RSS
-SOURCES = {
-    "36Kr": [("36Kr", "https://www.36kr.com/feed")],
-    "机器之心": [
-        ("机器之心", "https://www.jiqizhixin.com/rss"),
-        ("量子位", "https://www.qbitai.com/feed"),
-    ],
-    "HackerNews": [("HackerNews", "https://hnrss.org/newest?q={q}")],
-    "TechCrunch": [("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/")],
-}
-
-# HackerNews 是关键词检索型 RSS，需要英文检索词
-SEARCH_TERMS = {
-    "大模型": "LLM",
-    "AI Agent": "agent",
-    "具身智能": "robot",
-    "RAG": "RAG",
-}
-
-# 监控关键词 → 中英文匹配词
-KEYWORD_ALIASES = {
-    "大模型": [
-        "大模型", "大语言模型", "llm", "large language model",
-        "gpt", "claude", "gemini", "llama", "deepseek",
-    ],
-    "AI Agent": [
-        "ai agent", "agents", "agentic", "agent", "智能体", "多智能体",
-    ],
-    "具身智能": [
-        "具身智能", "embodied", "humanoid", "robot", "robotics", "机器人",
-    ],
-    "RAG": [
-        "rag", "retrieval-augmented", "retrieval augmented", "检索增强", "向量检索",
-    ],
-}
 
 POSITIVE_WORDS = [
     "launch", "funding", "raises", "breakthrough", "partnership", "record",
@@ -106,11 +70,22 @@ def match_keyword(text: str, keyword: str) -> bool:
     return any(alias.lower() in lowered for alias in aliases)
 
 
+def _count_terms(text: str, terms: list[str]) -> int:
+    """英文词按边界匹配（避免 risk-free 命中 risk，但允许复数 s），中文按子串计数。"""
+    total = 0
+    for term in terms:
+        if term.isascii():
+            total += len(re.findall(rf"(?<![a-z-]){re.escape(term)}s?(?![a-z-])", text))
+        else:
+            total += text.count(term)
+    return total
+
+
 def guess_sentiment(text: str) -> str:
     """轻量规则情感判定，真正的情感聚合后续交给 LLM。"""
     lowered = text.lower()
-    pos = sum(lowered.count(word) for word in POSITIVE_WORDS)
-    neg = sum(lowered.count(word) for word in NEGATIVE_WORDS)
+    pos = _count_terms(lowered, POSITIVE_WORDS)
+    neg = _count_terms(lowered, NEGATIVE_WORDS)
 
     if neg > pos:
         return "negative"
@@ -202,7 +177,7 @@ def fetch_all(
         for label, url in specs:
             items = fetch_source(label, url, keyword, per_source, log)
             if items is not None:
-                if label != logical:
+                if len(specs) > 1 and label != logical:
                     log(f"[WARN] {logical} 源不可用，已回退至 {label}")
                 break
 

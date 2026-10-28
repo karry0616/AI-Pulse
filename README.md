@@ -10,7 +10,7 @@
 
 ```mermaid
 flowchart LR
-    A["RSS 源<br/>TechCrunch · 36Kr · 机器之心/量子位 · HackerNews"] --> B["fetcher<br/>清洗 · 关键词过滤 · 规则情感"]
+    A["RSS 源<br/>36Kr · 机器之心/量子位 · TechCrunch · HackerNews<br/>arXiv · InfoQ · Solidot"] --> B["fetcher<br/>清洗 · 关键词过滤 · 规则情感"]
     B --> C[("SQLite<br/>daily_intel")]
     C --> D["Chroma 向量记忆<br/>近 7 天 · 降级为关键词检索"]
     C --> E
@@ -48,9 +48,12 @@ Copy-Item .env.example .env    # 填 DEEPSEEK_API_KEY / WEBHOOK_URL
 可选：每天 08:00 自动跑一次
 
 ```powershell
-.\.venv\Scripts\python.exe scheduler_service.py        # 常驻
+.\.venv\Scripts\python.exe scheduler_service.py        # 常驻（默认跑全部关键词）
 .\.venv\Scripts\python.exe scheduler_service.py --now  # 立即跑一次
+.\.venv\Scripts\python.exe scheduler_service.py --now --keywords "大模型,RAG"
 ```
+
+每次 run 结束会在 `reports/` 下生成 `YYYY-MM-DD-{keyword}.md` 日报（已 gitignore）。
 
 ## 2 分钟演示脚本
 
@@ -88,18 +91,18 @@ Copy-Item .env.example .env    # 填 DEEPSEEK_API_KEY / WEBHOOK_URL
 一次 run 通常 2 次调用（Collector + Analyst），Critic 是规则校验不花 token；重试上限 3 次；`max_tokens` 有上限；每次调用按 `run_id` 落库，可直接汇总。
 
 **Q7：重复抓取怎么处理？**
-`daily_intel` 以 `(date, title)` 唯一去重，Chroma 以 `date|title` 的 SHA1 做幂等 upsert。已知缺陷：同一条新闻只归属首次命中的关键词，跨关键词统计会漏——已在「已知限制」中列出。
+`daily_intel` 以 `(date, title, keyword)` 唯一去重，同一条新闻可同时归属多个关键词；每次 run 前用 `filter_unseen` 只把新条目送去分析，已入库的跳过。Chroma 以 `date|title` 的 SHA1 做幂等 upsert。
 
 **Q8：这个项目最大的不足是什么？**
-没有鉴权、单机 SQLite、情感判定依赖词表。生产化还需要补登录与审批人记录、给抓取加增量游标、把配置与数据源注册表化。
+没有鉴权、单机 SQLite、情感判定依赖词表。数据源与关键词已收敛到 `sources.py`；生产化还需要补登录与审批人记录、把调度从单机常驻进程迁到受管 cron。
 
 ## 已知限制
 
 - 无登录鉴权：任何能访问页面的人都能触发更新与审批推送。
-- 测试覆盖契约校验、抓取纯函数、SQLite 持久层、运行锁（`pytest`，38 个用例）；CI 见 `.github/workflows/ci.yml`。
+- 测试覆盖契约校验、抓取纯函数、SQLite 持久层、数据源注册表、调度编排、运行锁（`pytest`，58 个用例）；CI 见 `.github/workflows/ci.yml`。
 - 单机 SQLite + 本机 Chroma；已加跨进程运行锁（`.pulse.lock`），多实例部署仍未验证。
-- 情感标签来自词表规则，负面覆盖不足；LLM 模式下由 Collector 重新判定。
-- 数据源与关键词为硬编码常量，`Twitter/X` 无公开 RSS。
+- 情感标签先用词表规则打底，LLM 模式下由 Collector 重新判定并回写；无 Key 时仍以词表为准。
+- 数据源与关键词统一在 `sources.py`，`Twitter/X` 无公开 RSS 已移除。
 - `.env` 明文保存密钥；`WEBHOOK_URL` 建议指向自己的钉钉/飞书机器人。
 
 ## 目录
@@ -109,9 +112,11 @@ app.py                Streamlit 页面（布局、KPI、HITL 按钮、日志面�
 ui/style.css          页面全局样式（从 app.py 抽出）
 ui/charts.py          Plotly 图表构建
 ui/trace.py           Agent 执行轨迹面板
-pipeline.py           一次 run 的编排：抓取 → RAG → Agent → 预警暂存（含运行锁）
+pipeline.py           一次 run 的编排：增量过滤 → 抓取 → RAG → Agent → 预警暂存 → 日报
 fetcher.py            RSS 抓取、清洗、关键词匹配、规则情感
-database.py           SQLite：资讯、run_logs、llm_calls、alerts
+sources.py            数据源 / 关键词 / 检索词 / 别名唯一注册表
+reports.py            Markdown 日报导出
+database.py           SQLite：资讯、run_logs、llm_calls、alerts（含 user_version 迁移）
 llm/client.py         DeepSeek JSON Mode 封装 + token/耗时计量 + 重试退避
 agents/               state / prompts / collector / analyst / critic / graph
 rag/store.py          Chroma 向量记忆 + 关键词降级检索
