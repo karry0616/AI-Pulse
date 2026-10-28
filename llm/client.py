@@ -22,6 +22,9 @@ import database
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-chat"
 API_TIMEOUT = 60
+MAX_RETRIES = 2
+RETRY_STATUS = {429, 500, 502, 503, 504}
+BACKOFF_SECONDS = 1.0
 
 
 class LLMUnavailable(RuntimeError):
@@ -77,21 +80,33 @@ def chat(
         payload["response_format"] = {"type": "json_object"}
 
     started = time.perf_counter()
-    try:
-        resp = requests.post(
-            DEEPSEEK_API_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=API_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        database.log_llm_call(run_id, node, MODEL, 0, 0, latency_ms, ok=False,
-                              error=type(exc).__name__)
-        raise LLMUnavailable(f"DeepSeek 网络异常：{type(exc).__name__}") from exc
+    resp = None
+    attempts = 0
+    for attempt in range(MAX_RETRIES + 1):
+        attempts = attempt + 1
+        try:
+            resp = requests.post(
+                DEEPSEEK_API_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=API_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            if attempt < MAX_RETRIES:
+                time.sleep(BACKOFF_SECONDS * (2 ** attempt))
+                continue
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            database.log_llm_call(run_id, node, MODEL, 0, 0, latency_ms, ok=False,
+                                  error=f"{type(exc).__name__} after {attempts} attempts")
+            raise LLMUnavailable(f"DeepSeek 网络异常：{type(exc).__name__}") from exc
+
+        if resp.status_code in RETRY_STATUS and attempt < MAX_RETRIES:
+            time.sleep(BACKOFF_SECONDS * (2 ** attempt))
+            continue
+        break
 
     latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -102,7 +117,7 @@ def chat(
         except ValueError:
             detail = resp.text[:120]
         database.log_llm_call(run_id, node, MODEL, 0, 0, latency_ms, ok=False,
-                              error=f"HTTP {resp.status_code}")
+                              error=f"HTTP {resp.status_code} after {attempts} attempts")
         raise LLMCallError(f"DeepSeek HTTP {resp.status_code}: {detail}")
 
     try:

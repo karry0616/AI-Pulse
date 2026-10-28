@@ -13,6 +13,8 @@ pulse.db
 *.db-journal
 *.db-wal
 *.db-shm
+# 运行锁（跨进程互斥，运行时自动生成）
+.pulse.lock
 
 # ===== RAG 向量库（可重建） =====
 chroma_db/

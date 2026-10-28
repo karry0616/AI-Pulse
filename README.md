@@ -91,13 +91,13 @@ Copy-Item .env.example .env    # 填 DEEPSEEK_API_KEY / WEBHOOK_URL
 `daily_intel` 以 `(date, title)` 唯一去重，Chroma 以 `date|title` 的 SHA1 做幂等 upsert。已知缺陷：同一条新闻只归属首次命中的关键词，跨关键词统计会漏——已在「已知限制」中列出。
 
 **Q8：这个项目最大的不足是什么？**
-没有鉴权、没有测试、单机 SQLite、情感判定依赖词表。生产化需要补登录与审批人记录、加锁避免并发 run、给抓取加增量游标、把配置与数据源注册表化。
+没有鉴权、单机 SQLite、情感判定依赖词表。生产化还需要补登录与审批人记录、给抓取加增量游标、把配置与数据源注册表化。
 
 ## 已知限制
 
 - 无登录鉴权：任何能访问页面的人都能触发更新与审批推送。
-- 无自动化测试；仅有 `--force-bad`、`python -m llm.client` 等手工自测入口。
-- 单机 SQLite + 本机 Chroma，未做多实例并发控制。
+- 测试覆盖契约校验、抓取纯函数、SQLite 持久层、运行锁（`pytest`，38 个用例）；CI 见 `.github/workflows/ci.yml`。
+- 单机 SQLite + 本机 Chroma；已加跨进程运行锁（`.pulse.lock`），多实例部署仍未验证。
 - 情感标签来自词表规则，负面覆盖不足；LLM 模式下由 Collector 重新判定。
 - 数据源与关键词为硬编码常量，`Twitter/X` 无公开 RSS。
 - `.env` 明文保存密钥；`WEBHOOK_URL` 建议指向自己的钉钉/飞书机器人。
@@ -105,14 +105,19 @@ Copy-Item .env.example .env    # 填 DEEPSEEK_API_KEY / WEBHOOK_URL
 ## 目录
 
 ```
-app.py                Streamlit 页面（布局、图表、HITL 按钮、执行轨迹）
-pipeline.py           一次 run 的编排：抓取 → RAG → Agent → 预警暂存
+app.py                Streamlit 页面（布局、KPI、HITL 按钮、日志面板）
+ui/style.css          页面全局样式（从 app.py 抽出）
+ui/charts.py          Plotly 图表构建
+ui/trace.py           Agent 执行轨迹面板
+pipeline.py           一次 run 的编排：抓取 → RAG → Agent → 预警暂存（含运行锁）
 fetcher.py            RSS 抓取、清洗、关键词匹配、规则情感
 database.py           SQLite：资讯、run_logs、llm_calls、alerts
-llm/client.py         DeepSeek JSON Mode 封装 + token/耗时计量
+llm/client.py         DeepSeek JSON Mode 封装 + token/耗时计量 + 重试退避
 agents/               state / prompts / collector / analyst / critic / graph
 rag/store.py          Chroma 向量记忆 + 关键词降级检索
 rag/memory.py         历史召回上下文与周同比
 notify.py             钉钉 / 飞书 Webhook（含加签）
 scheduler_service.py  APScheduler 每日 08:00
+tests/                pytest 用例
+docs/ARCHITECTURE.md  架构分析与迭代路线图
 ```

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 import config
 import database
@@ -32,14 +36,98 @@ class RunResult:
     error: str = ""
 
 
+LOCK_PATH = Path(__file__).resolve().parent / ".pulse.lock"
+LOCK_STALE_SECONDS = 30 * 60  # 超过 30 分钟视为异常残留，可被抢占
+
+
+class RunLocked(RuntimeError):
+    """已有任务在运行，本次拒绝启动（防止重复扣费与并发写库）。"""
+
+
+def _read_lock() -> dict:
+    try:
+        data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _lock_is_stale() -> bool:
+    try:
+        age = time.time() - LOCK_PATH.stat().st_mtime
+    except OSError:
+        return True
+    return age > LOCK_STALE_SECONDS
+
+
+@contextmanager
+def run_lock(keyword: str, trigger: str, log=print):
+    """跨进程互斥：UI 手动、调度器、多个浏览器会话共用一把锁。"""
+    for _ in range(2):
+        try:
+            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            holder = _read_lock()
+            if not _lock_is_stale():
+                raise RunLocked(
+                    f"已有任务正在运行（pid {holder.get('pid', '?')} · "
+                    f"{holder.get('keyword', '?')} · {holder.get('trigger', '?')}），请稍后重试"
+                )
+            log(f"[LOCK] 清理残留锁（pid {holder.get('pid', '?')}）")
+            try:
+                LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "pid": os.getpid(),
+                    "keyword": keyword,
+                    "trigger": trigger,
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                fh,
+                ensure_ascii=False,
+            )
+        log(f"[LOCK] 已获取运行锁（pid {os.getpid()}）")
+        try:
+            yield
+        finally:
+            try:
+                LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            log("[LOCK] 运行锁已释放")
+        return
+
+    raise RunLocked("锁竞争失败，请稍后重试")
+
+
 def run(
     keyword: str,
     sources: list[str],
     trigger: str = "manual",
     log=print,
 ) -> RunResult:
+    with run_lock(keyword, trigger, log=log):
+        return _run_once(keyword, sources, trigger, log)
+
+
+def _run_once(
+    keyword: str,
+    sources: list[str],
+    trigger: str,
+    log,
+) -> RunResult:
     run_id = uuid.uuid4().hex[:12]
     started = time.perf_counter()
+
+    expired = database.expire_stale_alerts()
+    if expired:
+        log(f"[HITL] 已过期 {expired} 条超过 24 小时未审核的预警")
+
     database.start_run(run_id, trigger, keyword, sources)
 
     try:
@@ -170,7 +258,11 @@ def main() -> int:
         print(f"[{datetime.now():%H:%M:%S}] {message}")
 
     sources = [item.strip() for item in args.sources.split(",") if item.strip()]
-    result = run(args.keyword, sources, trigger=args.trigger, log=log)
+    try:
+        result = run(args.keyword, sources, trigger=args.trigger, log=log)
+    except RunLocked as exc:
+        log(f"[WARN] {exc}")
+        return 1
 
     log(f"run_id={result.run_id} · 入库 {result.inserted} 条 · 模式 {result.analysis['_mode']}")
     log(f"预警任务：{result.alert_id}")

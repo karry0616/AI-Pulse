@@ -347,7 +347,31 @@ def save_alert(
     level: str = "LOW",
     heat_score: int | None = None,
 ) -> int:
+    """写入待审批预警；同 keyword 当天已有待审/失败任务时复用并更新内容。"""
     with _connect() as conn:
+        existing = conn.execute(
+            """
+            SELECT id FROM alerts
+             WHERE keyword = ? AND status IN ('pending', 'failed')
+               AND date(created_at) = date('now', 'localtime')
+             ORDER BY id DESC LIMIT 1
+            """,
+            (keyword,),
+        ).fetchone()
+
+        if existing:
+            alert_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE alerts
+                   SET run_id = ?, level = ?, heat_score = ?, warning_text = ?,
+                       status = 'pending'
+                 WHERE id = ?
+                """,
+                (run_id, level, heat_score, warning_text, alert_id),
+            )
+            return alert_id
+
         cursor = conn.execute(
             """
             INSERT INTO alerts
@@ -357,6 +381,18 @@ def save_alert(
             (run_id, keyword, level, heat_score, warning_text, _now()),
         )
         return int(cursor.lastrowid)
+
+
+def expire_stale_alerts(hours: int = 24) -> int:
+    """把超过 N 小时仍无人审核的 pending 预警标记为 expired，返回条数。"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE alerts SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
+            (cutoff,),
+        )
+        return int(cursor.rowcount or 0)
+
 
 
 def get_alert(alert_id: int) -> dict | None:

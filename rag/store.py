@@ -11,6 +11,7 @@ import hashlib
 import math
 import re
 import sys
+import time
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
@@ -20,23 +21,27 @@ import database
 CHROMA_DIR = Path(__file__).resolve().parent.parent / "chroma_db"
 COLLECTION_NAME = "intel_history"
 EMBED_DIM = 512
+RETRY_COOLDOWN = 300  # 向量库失败后的冷却秒数，到期自动重试
 
 _collection = None
-_disabled_reason = ""
+_disabled_until = 0.0
 
 
 def _disable(reason: str, log=print) -> None:
-    global _collection, _disabled_reason
-    _disabled_reason = reason
+    global _collection, _disabled_until
+    _disabled_until = time.time() + RETRY_COOLDOWN
     _collection = None
-    log(f"[RAG] 向量库不可用，降级关键词检索：{reason[:120]}")
+    log(
+        f"[RAG] 向量库不可用，降级关键词检索"
+        f"（{RETRY_COOLDOWN // 60} 分钟后重试）：{reason[:120]}"
+    )
 
 
 def _get_collection(log=print):
-    global _collection
+    global _collection, _disabled_until
     if _collection is not None:
         return _collection
-    if _disabled_reason:
+    if _disabled_until and time.time() < _disabled_until:
         return None
 
     try:
@@ -47,6 +52,7 @@ def _get_collection(log=print):
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
+        _disabled_until = 0.0
         return _collection
     except Exception as exc:  # 依赖缺失、目录权限、嵌入模型初始化失败
         _disable(f"{type(exc).__name__}: {exc}", log)

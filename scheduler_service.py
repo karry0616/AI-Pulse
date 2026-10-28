@@ -31,6 +31,9 @@ def run_once(keyword: str, sources: list[str]) -> int:
     log(f"[SCHED] 开始每日任务：keyword={keyword} · sources={len(sources)}")
     try:
         result = pipeline.run(keyword, sources, trigger="schedule", log=log)
+    except pipeline.RunLocked as exc:
+        log(f"[SCHED] 已有任务在运行，本次跳过：{exc}")
+        return 0
     except Exception as exc:
         log(f"[SCHED] 任务失败：{type(exc).__name__}: {exc}")
         return 1
