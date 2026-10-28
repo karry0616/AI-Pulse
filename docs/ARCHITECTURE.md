@@ -1,8 +1,88 @@
 # AI Pulse 架构与代码库分析报告
 
-> 分析对象：本仓库全部源码（19 个 Python 文件，约 2772 行，不含 README 与依赖清单）
+> 分析对象：本仓库全部源码（35 个 Python 文件，约 3300 行，含 `ui/` 与 `tests/`；不含 README 与依赖清单）
 > 分析方式：全量源码通读 + 调用链追踪 + 依赖关系核对
-> 更新时间：2026-10-28
+> 更新时间：2026-10-28（P0 / P1 阶段完成并提交后）
+> 文档用途：既是架构分析，也是**交接文档**。其他 Agent / 开发者读「项目现状速览」+「十、实施进度」即可知道项目做了什么、还没做什么。
+
+---
+
+## 项目现状速览（交接用，2026-10-28）
+
+**一句话**：单机可运行的 AI 行业情报系统——RSS 抓取 → SQLite → Chroma 历史记忆 → Collector/Analyst/Critic 三 Agent → 预警人工审批 → Webhook 推送，每次 run 额外产出一份 Markdown 日报。
+
+**模块职责**
+
+| 文件 | 职责 | 备注 |
+| --- | --- | --- |
+| `app.py` | Streamlit 页面：KPI、图表、报告区、Agent 轨迹、HITL 审批 | 476 行，布局样式已抽到 `ui/` |
+| `ui/style.css` · `ui/charts.py` · `ui/trace.py` | 页面样式 / Plotly 图表 / 轨迹面板 | 从 app.py 拆出，视觉零改动 |
+| `pipeline.py` | 一次 run 的总编排 + 跨进程运行锁 + 热度计算 + 日报导出 | 唯一入口，UI 与调度器都调它 |
+| `fetcher.py` | RSS 抓取、清洗、关键词匹配、规则情感（词边界匹配） | 只抓公开 RSS |
+| `sources.py` | 数据源 / 关键词 / 检索词 / 别名的唯一注册表 | **加源、加关键词只改这里** |
+| `database.py` | SQLite 四张表、`user_version` 迁移、去重、增量过滤、情感回写 | 所有 SQL 集中在此 |
+| `reports.py` | Markdown 日报渲染与落盘 | 写 `reports/`，已 gitignore |
+| `agents/` | `state` / `prompts` / `collector` / `analyst` / `critic` / `graph` | 60 行纯代码状态机，不依赖 LangGraph |
+| `llm/client.py` | DeepSeek JSON Mode、token 计量、429/5xx 退避重试 | 每次调用落 `llm_calls` |
+| `rag/store.py` · `rag/memory.py` | Chroma 向量记忆（失败 5 分钟冷却重试）+ 周同比 | 嵌入是字符 n-gram 哈希，离线可跑 |
+| `notify.py` | 钉钉 HMAC 加签 / 飞书卡片推送 | 只在人工审批后调用 |
+| `scheduler_service.py` | APScheduler 每天 08:00，多关键词串行 | 独立进程，复用运行锁 |
+| `tests/` | 58 个 pytest 用例 | CI：`.github/workflows/ci.yml` |
+
+**一次 run 的实际顺序（当前代码）**
+
+```
+pipeline.run(keyword, sources, trigger)
+  → 获取 .pulse.lock 跨进程锁（30 分钟残留可抢占）
+  → 过期预警 expire_stale_alerts(24h)
+  → fetcher.fetch_all()                  串行抓源，单源失败回退/跳过
+  → database.filter_unseen()             计算真正的新条目
+  → database.save_items()                (date,title,keyword) 去重入库
+  → [无新条目] 回退最近 1 天存档继续分析
+  → rag_store.index_items()              SQLite → Chroma 幂等 upsert
+  → rag_memory.build_context()           召回近 7 天相似 + 周同比
+  → agents.graph.run()                   Collector → Analyst → Critic（≤3 次回边）
+  → pipeline.compute_heat()              代码计算热度，覆盖模型值
+  → database.update_sentiments()         Agent 判定情感回写数据库
+  → [negative_alerts > 0] save_alert()   只暂存 pending，等待人工审批
+  → reports.save()                       写 reports/YYYY-MM-DD-{keyword}.md
+  → finish_run()                         回写 run_logs
+  → 释放锁
+推送不在本流程内：用户点「审核并发送」后走 pipeline.push_alert()
+```
+
+**数据层（SQLite，WAL）**
+
+| 表 | 用途 | 关键约束 |
+| --- | --- | --- |
+| `daily_intel` | 抓取到的资讯 | `UNIQUE(date, title, keyword)`；`user_version=1` 由 v0 迁移而来 |
+| `run_logs` | 每次 run 的状态、条数、耗时、错误 | `run_id` 主键 |
+| `llm_calls` | 每次 LLM 调用的 token / 耗时 / 成败 | 按 `run_id + node` 可审计 |
+| `alerts` | 预警与审批状态 | `pending / sent / failed / expired` |
+
+**常用命令**
+
+```powershell
+.\.venv\Scripts\streamlit.exe run app.py                       # 页面
+.\.venv\Scripts\python.exe pipeline.py --keyword "AI Agent"    # 手动跑一次
+.\.venv\Scripts\python.exe scheduler_service.py --now --keywords "大模型,RAG"
+.\.venv\Scripts\python.exe -m pytest -q                        # 58 个用例
+```
+
+**设计约束（不要违背）**
+
+1. 不改现有前端 UI 布局；
+2. Agent 编排用纯代码状态机，不引入 LangGraph；
+3. 调度器是独立进程，不与 Streamlit 会话耦合；
+4. 预警必须人工审核后才推送，模型不能直接对外广播。
+
+**本地开发注意**
+
+- Windows PowerShell 5 不支持 `&&`，多条命令用 `;` 分隔；
+- Streamlit 热重载不会刷新被 import 的模块，改 `ui/` 或非入口文件后需重启进程；
+- Python 解释器统一用 `.\.venv\Scripts\python.exe`，直接 `python` 可能不是虚拟环境。
+
+**当前完成度**：P0（5 项）与 P1（7 项）全部落地并验证（58 用例通过 + 一次真实端到端 run），P2（5 项）未开始。详见「十、实施进度」。
 
 ---
 
@@ -12,18 +92,18 @@
 | --- | --- | --- |
 | 功能闭环 | 9 / 10 | 从抓 RSS 到人工审批推送，全链路真跑通，不是 Mock |
 | 代码分层 | 8 / 10 | 依赖单向、无循环导入，职责边界清楚 |
-| 工程质量 | 5 / 10 | 零测试、零 CI、入口文件过大 |
-| 生产可用度 | 4 / 10 | 无鉴权、无并发锁、无监控、无部署形态 |
-| 可扩展性 | 6 / 10 | 数据源 / 关键词 / 阈值全是硬编码，加一个源要改源码 |
+| 工程质量 | 8 / 10 | 58 个 pytest 用例 + CI；仍缺覆盖率门槛与类型检查 |
+| 生产可用度 | 5 / 10 | 有并发锁与预警去重，但无鉴权、无审计、无部署形态 |
+| 可扩展性 | 8 / 10 | 数据源 / 关键词已收敛到 `sources.py`；阈值仍硬编码 |
 
-**定位判断**：这是一个「完整度很高的演示级 MVP + 半个生产项目」。它已经能支撑一场技术面试的完整讲解，但要交给别人真正每天使用，还差三块：**并发安全、事实校验、可运维性**。
+**定位判断**：这是一个「完整度很高的单机情报系统」。经过 P0 / P1 两轮改造，它已跨过「只能演示」的门槛；要交给别人每天使用，还差三块：**鉴权与审计、事件级建模、可运维性（部署 / 日志 / 留存）**。
 
-**如果只做 5 件事**：
-1. 加并发锁（防止重复扣 token、重复写库）
-2. 补 pytest + GitHub Actions（把现有纯函数变成可验证资产）
-3. 拆分 980 行的 `app.py`（CSS / 图表 / 轨迹面板各自独立）
-4. 修「跨关键词新闻归属丢失」这个数据模型坑
-5. 把 `heat_score`、`top_news` 从「模型自由发挥」改成「代码算 + 模型解释」
+**下一步最值得做的 5 件事**：
+1. 登录鉴权 + 审批人审计（`reviewed_by` / `review_note`）
+2. 事件线与实体追踪（把「新闻摘要」升级为「事件跟踪」）
+3. 把 `pipeline.run` 暴露成 API / MCP，让其他系统能调用
+4. 飞书卡片回调审批（移动端 HITL）
+5. 数据留存策略与 Docker / HTTPS 部署
 
 ---
 
@@ -42,26 +122,32 @@ AI Pulse/
 ├── notify.py             137 行   钉钉加签 / 飞书卡片 Webhook
 ├── scheduler_service.py  110 行   APScheduler 每日 08:00 独立进程
 ├── config.py              33 行   自己写的 .env 加载器
+├── UI layer
+│   ├── ui/style.css      355 行   页面样式（从 app.py 原样搬出）
+│   ├── ui/charts.py      133 行   Plotly 图表
+│   └── ui/trace.py        95 行   Agent 轨迹面板
 ├── agents/               485 行   state / prompts / collector / analyst / critic / graph
 ├── llm/client.py         148 行   DeepSeek JSON Mode + token 计量
 ├── rag/store.py          227 行   Chroma 向量库 + 关键词降级检索
 ├── rag/memory.py          48 行   历史召回上下文 + 周同比
+├── tests/                456 行   58 个 pytest 用例
+├── .github/workflows/ci.yml      GitHub Actions（pytest，无密钥）
 ├── docs/                         本目录：架构与迭代文档
-├── README.md             124 行
+├── README.md
 └── requirements.txt        7 行
 ```
 
-体量分布：`app.py` 从 980 行压到 476 行（CSS / 图表 / 轨迹已拆到 `ui/`），新增的 `sources.py` 与 `reports.py` 各自职责单一。
+体量分布：`app.py` 从 980 行压到 476 行（CSS / 图表 / 轨迹已拆到 `ui/`），新增的 `sources.py` 与 `reports.py` 各自职责单一；测试代码已占全部 Python 代码的约 14%。
 
 ### 2.2 技术选型与评价
 
 | 层 | 选型 | 选得对吗 | 代价是什么 |
 | --- | --- | --- | --- |
 | 界面 | Streamlit 1.49+ / Plotly 6 | ✅ 对。纯 Python 出效果，零前端成本 | 无鉴权、长任务阻塞页面、`session_state` 刷新即丢 |
-| 大模型 | DeepSeek + 裸 `requests` | ✅ 对。JSON Mode 稳定、便宜 | 没有重试 / 退避、没有流式、同步阻塞 |
-| 存储 | SQLite（WAL）+ pandas | ✅ 对。零运维、单机最合适 | 单写锁、无迁移机制、无归档 |
+| 大模型 | DeepSeek + 裸 `requests` | ✅ 对。JSON Mode 稳定、便宜 | 已有 429/5xx 两次退避重试；仍无流式、同步阻塞 |
+| 存储 | SQLite（WAL）+ pandas | ✅ 对。零运维、单机最合适 | 单写锁、有 `user_version` 迁移、无归档留存 |
 | 向量 | ChromaDB + **自研 512 维字符 n-gram 哈希嵌入** | ⚠️ 有取舍。完全离线，不下载模型 | 只有字面相似度，同义词召回弱（"大模型"召不到 "LLM"） |
-| 调度 | APScheduler 3.x（BlockingScheduler） | ✅ 对。够轻、够用 | 任务不持久化、只能单关键词、重启即重来 |
+| 调度 | APScheduler 3.x（BlockingScheduler） | ✅ 对。够轻、够用 | 任务不持久化、重启需重跑；已支持多关键词串行 |
 | 推送 | requests + HMAC-SHA256 加签 | ✅ 对 | 无重试、无飞书回调按钮 |
 | 配置 | 自写 `.env` 解析（不引 python-dotenv） | ✅ 对，展示基本功 | 无字段校验、无类型检查 |
 
@@ -70,17 +156,19 @@ AI Pulse/
 ### 2.3 依赖关系图（已核对：无循环导入）
 
 ```
-app.py ─┐                    ┌─→ fetcher ──→ database
+app.py ─┐                    ┌─→ fetcher ──→ sources / database
         ├─→ pipeline ────────┤
 scheduler_service.py ─┘      ├─→ rag.store ──→ chroma / database
                              ├─→ rag.memory ──→ rag.store / database
+                             ├─→ reports ──→ reports/*.md（文件系统）
                              └─→ agents.graph
                                     ├─ collector ─┐
                                     ├─ analyst ───┼─→ llm.client ──→ DeepSeek / database
                                     ├─ critic ────┘
                                     └─ prompts
                              pipeline.push_alert ──→ notify ──→ config
-database / config 被所有人依赖，但自己谁也不依赖（叶子节点）
+app.py ──→ ui.charts / ui.trace
+database / sources / config 被所有人依赖，但自己谁也不依赖（叶子节点）
 ```
 
 这个结构是**合格的分层**：入口（UI / 调度）→ 编排（pipeline）→ 能力（agents / rag / fetcher）→ 基础设施（llm / database / config）。没有一处 `database` 反过来 import `pipeline`，这是很多人写小项目时最容易犯的错，这里没犯。
@@ -88,24 +176,30 @@ database / config 被所有人依赖，但自己谁也不依赖（叶子节点�
 ### 2.4 一次完整 run 的调用链
 
 ```
-pipeline.run(keyword, sources)                                   # pipeline.py:29
-  ├─ database.start_run()                      写 run_logs（status=running）
-  ├─ fetcher.fetch_all()                       4 个源串行抓，单源失败自动回退
-  ├─ database.save_items()                     INSERT OR IGNORE 去重
-  ├─ [无新数据] database.fetch_recent(1天)     兜底用存档继续分析
-  ├─ rag_store.backfill(7天) + index_items()   SQLite → Chroma 幂等 upsert
+pipeline.run(keyword, sources, trigger)                         # pipeline.py
+  ├─ run_lock()                                 跨进程 .pulse.lock，残留 30 分钟可抢占
+  ├─ expire_stale_alerts(24h)                   清理超时未审预警
+  ├─ database.start_run()                       写 run_logs（status=running）
+  ├─ fetcher.fetch_all()                        7 个逻辑源串行抓，单源失败自动回退
+  ├─ database.filter_unseen()                   只保留尚未入库的新条目
+  ├─ database.save_items()                      INSERT OR IGNORE 去重
+  ├─ [无新数据] database.fetch_recent(1天)        兜底用存档继续分析
+  ├─ rag_store.backfill(7天) + index_items()    SQLite → Chroma 幂等 upsert
   ├─ rag_memory.build_context()
-  │    ├─ store.query_similar()                7 天窗口 cosine 召回，失败降级
-  │    └─ _week_over_week()                    SQLite 算周同比（禁止模型自算）
-  ├─ agents.graph.run()                        ★ 核心
-  │    ├─ collector.run()                      LLM 抽事件 / 规则降级
+  │    ├─ store.query_similar()                 7 天窗口 cosine 召回，失败降级
+  │    └─ _week_over_week()                     SQLite 算周同比（禁止模型自算）
+  ├─ agents.graph.run()                         ★ 核心
+  │    ├─ collector.run()                       LLM 抽事件 / 规则降级
   │    ├─ for attempt in 1..3:
-  │    │    ├─ analyst.run()                   LLM 出 7 字段 JSON
-  │    │    └─ critic.check_contract()         契约校验，失败把 issues 回灌
-  │    └─ critic.finalize()                    数值归一 + 默认值兜底
-  ├─ [negative_alerts > 0] database.save_alert()   只暂存 pending，不推送
-  ├─ database.usage_summary()                  本 run 的 token / 耗时
-  └─ database.finish_run()                     回写 success / failed
+  │    │    ├─ analyst.run()                    LLM 出 7 字段 JSON
+  │    │    └─ critic.check_contract()          9 类契约校验，失败把 issues 回灌
+  │    └─ critic.finalize()                     数值归一 + 默认值兜底
+  ├─ compute_heat()                             条数 + 源数算热度，覆盖模型自报值
+  ├─ database.update_sentiments()               Agent 判定情感回写 daily_intel
+  ├─ [negative_alerts > 0] database.save_alert()    只暂存 pending，不推送
+  ├─ database.usage_summary()                   本 run 的 token / 耗时
+  ├─ reports.save()                             写 reports/YYYY-MM-DD-{keyword}.md
+  └─ database.finish_run()                      回写 success / failed
 ```
 
 注意最后一步的分岔：**推送不在这个流程里**。真正发送要等用户在页面上点「审核并发送」，走 `pipeline.push_alert()` → `notify.send_webhook()` → 回写 `alerts.status`。这条设计是整个项目最值得讲的部分之一。
@@ -136,7 +230,7 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 ## 四、真正的技术亮点
 
-1. **把「结构校验」做成了 LLM 的质检门。** 大多数同类项目直接 `json.loads` 完就往页面上怼，模型少个字段就白屏。这里的 Critic 校验了 8 件事，其中一条特别聪明：`negative_alerts` 不能超过输入资讯条数——**这是唯一一条真正触碰「事实」的约束**，其余都是格式约束。
+1. **把「结构校验」做成了 LLM 的质检门。** 大多数同类项目直接 `json.loads` 完就往页面上怼，模型少个字段就白屏。这里的 Critic 校验了 9 件事，其中两条真正触碰「事实」：`negative_alerts` 不能超过输入资讯条数；`top_news` 的短标题必须能在输入标题中找到（包含关系或字符重合 ≥ 0.6，不足 3 条打回）。其余是格式约束。
 
 2. **降级不是一句口号，是三层各自兜底。** 没 Key → 规则引擎；JSON 非法 → 打回重算；Chroma 挂 → 字符重合度检索。任何一层挂了，用户看到的仍然是完整页面 + 明确原因。**这是演示场景最关键的护城河**，因为现场网络永远不可靠。
 
@@ -194,15 +288,17 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 ## 六、可开发方向（价值 / 难度 / 收益）
 
+> 状态：标 ✅ 的条目已在 P0 / P1 阶段落地（括号内注明做到哪一步）；其余仍是待办。
+
 难度说明：★ = 半天到一天；★★ = 一个模块级改动；★★★ = 跨模块重构；★★★★ = 需要新架构能力。
 
 ### 6.1 功能扩展
 
 | 编号 | 方向 | 做什么 | 价值 | 难度 | 预期收益 |
 | --- | --- | --- | --- | --- | --- |
-| F1 | **多关键词并行任务** | scheduler 按关键词注册多个 job，一次跑完 4 个关键词 | ★★★★ | ★★ | 从「单关键词玩具」变成「真情报台」 |
-| F2 | **数据源插件化 + 扩源** | `config/sources.py` 注册表，新增 arXiv、Reddit、GitHub Trending、Product Hunt、X API | ★★★★★ | ★★ | 情报价值 = 覆盖率；同时消灭 Twitter/X 幽灵源 |
-| F3 | **日报 / 周报导出** | 一键导出 Markdown / PDF / 飞书文档；周报做 7 天聚合 | ★★★★ | ★★ | 产出「能发出去的东西」 |
+| F1 | **多关键词任务** ✅ | scheduler 支持 `--keywords`，默认 4 个关键词串行；并行 job 未做 | ★★★★ | ★★ | 从「单关键词玩具」变成「真情报台」 |
+| F2 | **数据源注册表 + 扩源** ✅ | `sources.py` 唯一注册表；新增 arXiv / InfoQ / Solidot（Reddit 在当前网络不可达，未采用） | ★★★★★ | ★★ | 情报价值 = 覆盖率；已消灭 Twitter/X 幽灵源 |
+| F3 | **日报 / 周报导出** ✅（Markdown 部分） | 每次 run 自动写 `reports/YYYY-MM-DD-{keyword}.md`；PDF / 飞书文档、7 天周报未做 | ★★★★ | ★★ | 产出「能发出去的东西」 |
 | F4 | **事件线与实体追踪** | 相似新闻合并为同一事件，跟踪「公司-模型-融资/事故」时间线 | ★★★★★ | ★★★★ | 从「新闻摘要」升级为「事件跟踪」 |
 | F5 | **预警规则中心** | 自定义负面词、阈值、z-score 热度突增检测 | ★★★★ | ★★★ | 降低误报 |
 | F6 | **飞书卡片回调审批** | 卡片带按钮，点「通过/驳回」直接改状态（需 FastAPI 回调端点） | ★★★ | ★★★ | 真正的移动端 HITL |
@@ -211,11 +307,11 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 | 编号 | 方向 | 做什么 | 价值 | 难度 | 收益 |
 | --- | --- | --- | --- | --- | --- |
-| P1 | **增量抓取游标** | 每个源记 `last_seen`，只把新条目送进 LLM | ★★★★ | ★★ | token 与耗时降 30%–70% |
-| P2 | **并行抓取** | `ThreadPoolExecutor` 抓 4 个源 | ★★★ | ★ | 抓取时长压到接近单源耗时 |
+| P1 | **增量抓取** ✅ | `filter_unseen` 只把新条目送进 LLM/RAG，无新增才回退近 1 天存档 | ★★★★ | ★★ | 重复点击不再重复扣费 |
+| P2 | **并行抓取** | `ThreadPoolExecutor` 抓 7 个源 | ★★★ | ★ | 抓取时长压到接近单源耗时 |
 | P3 | **当日结果缓存** | 同 keyword 同日重复点击直接回放上次结果 | ★★★ | ★ | 演示时不怕手抖连点 |
 | P4 | **检索质量升级** | 哈希向量 + BM25 混合召回（RRF 融合），或换本地小语义模型 | ★★★★ | ★★–★★★ | 召回从「字面重合」升级到「意思相近」 |
-| P5 | **LLM 调用治理** | 429 退避重试、单节点 30s 超时、run 级总预算 | ★★★ | ★ | 稳定性 + 费用上限 |
+| P5 | **LLM 调用治理** ✅（退避部分） | 429/5xx 两次指数退避已实现；单节点超时与 run 级预算未做 | ★★★ | ★ | 稳定性提升 |
 
 ### 6.3 体验提升
 
@@ -249,25 +345,25 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 ## 七、优先级路线图
 
-### P0 · 立即做（低难度、高收益、不改视觉）
+### P0 · 立即做（低难度、高收益、不改视觉）— ✅ 全部完成
 
-1. **并发锁 + 按钮冷却** → 验收：两个浏览器同时点，只有一个真正执行，另一个提示「任务进行中」
-2. **pytest 骨架 + GitHub Actions** → 验收：覆盖 8 类契约打回，CI 绿
-3. **拆分 app.py** → 验收：`ui/style.css` / `ui/charts.py` / `ui/trace.py`，页面与现在逐像素一致
-4. **Chroma 降级可恢复 + LLM 退避重试** → 验收：首次失败后第 2 次调用能恢复
-5. **预警去重 + `expired` / `ignored` 状态** → 验收：同 keyword 同日最多 1 条待审
+1. ✅ **并发锁 + 按钮冷却**：`pipeline.run_lock` 已挡住并发（UI 提示 RunLocked）；按钮级冷却未做
+2. ✅ **pytest 骨架 + GitHub Actions**：58 个用例，CI 绿（只装测试依赖，不装 streamlit / chromadb）
+3. ✅ **拆分 app.py**：`ui/style.css` / `ui/charts.py` / `ui/trace.py`，CSS 与原文件逐字符一致
+4. ✅ **Chroma 降级可恢复 + LLM 退避重试**：失败后 5 分钟冷却重试；429/5xx 两次退避
+5. ✅ **预警去重 + 过期状态**：同日同关键词复用；24 小时未审自动 `expired`
 
-### P1 · 下一阶段（把「能演示」变「能天天用」）
+### P1 · 下一阶段（把「能演示」变「能天天用」）— ✅ 全部完成
 
-6. 数据源注册表 + 新增 3 个源
-7. 跨关键词归属修复
-8. 情感口径统一
-9. 防幻觉补丁（`heat_score` 代码化 + `top_news` 标题核验）
-10. 多关键词调度
-11. 增量抓取
-12. 日报导出
+6. ✅ 数据源注册表（`sources.py`）+ 新增 arXiv / InfoQ / Solidot
+7. ✅ 跨关键词归属修复（`(date, title, keyword)` + `user_version` 迁移）
+8. ✅ 情感口径统一（Agent 判定回写；英文词边界匹配）
+9. ✅ 防幻觉补丁（`compute_heat` 代码化 + `top_news` 标题核验）
+10. ✅ 多关键词调度（`--keywords`，默认全部串行）
+11. ✅ 增量抓取（`filter_unseen`）
+12. ✅ 日报导出（`reports/*.md`）
 
-### P2 · 战略级（差异化与生态）
+### P2 · 战略级（差异化与生态）— ⏳ 未开始
 
 13. 事件线与实体追踪
 14. API / MCP 化
@@ -290,21 +386,25 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 
 ## 九、建议的落地节奏
 
-**第一批（先把地基焊死）**：并发锁 → 测试 → 拆 app.py
+**第一批（先把地基焊死）** ✅：并发锁 → 测试 → 拆 app.py
 这三件做完，项目就从「能跑」变成「敢改」。
 
-**第二批（把数据弄准）**：跨关键词归属 → 情感口径 → 防幻觉补丁
+**第二批（把数据弄准）** ✅：跨关键词归属 → 情感口径 → 防幻觉补丁
 这三件做完，页面上的数字才真正可信。
 
-**第三批（把价值放大）**：源注册表 → 多关键词 → 日报导出 → API / MCP
-这批开始才是真正的产品化。
+**第三批（把价值放大）**：源注册表 ✅ → 多关键词 ✅ → 日报导出 ✅ → API / MCP（未做）
+前四项已完成，最后一项才是真正的对外产品化。
 
 **衡量指标建议**（做完 P0 / P1 后应该达到）：
-- 重复 run 率 = 0
-- Critic 一次通过率 > 80%（当前未统计）
-- 单 run token < 4000、时长 < 20s
-- 预警人工判定误报率 < 20%
-- 接入源 ≥ 7 个
+
+| 指标 | 目标 | 当前 |
+| --- | --- | --- |
+| 重复 run 率 | 0 | ✅ 运行锁 + 增量过滤，第二次点击直接被拒或跳过 |
+| Critic 一次通过率 | > 80% | 未统计（`_attempts` 已落库，可后续聚合） |
+| 单 run token | < 4000 | ✅ 实测 3634（2 次调用） |
+| 单 run 时长 | < 20s | ✅ 实测 8.4s（4 个源 / 14 条） |
+| 预警人工判定误报率 | < 20% | 未统计 |
+| 接入源 | ≥ 7 个 | ✅ 7 个 |
 
 ---
 
@@ -325,4 +425,20 @@ pipeline.run(keyword, sources)                                   # pipeline.py:2
 | P1-11 | 增量抓取 | ✅ 已完成（`filter_unseen` 只分析新条目，无新增回退近 1 天存档） |
 | P1-12 | 日报导出 | ✅ 已完成（`reports/YYYY-MM-DD-{keyword}.md`，目录已 gitignore） |
 | P2 | 13–17 项 | ⏳ 待开始 |
+
+### 10.1 验证记录（2026-10-28）
+
+- `pytest -q`：**58 passed**（critic / fetcher / database / llm client / rag store / pipeline lock / scheduler / reports / sources）
+- `compileall`：全部源码模块通过
+- 真实端到端 run（arXiv + InfoQ + 36Kr + Solidot）：抓取 14 条、入库 14 条，Critic 一次通过，
+  `[GUARD] heat_score` 由代码修正为 1580（模型给 1520），预警落 `pending`，日报文件生成
+- Streamlit 启动：HTTP 200，`import app` 无异常（UI 布局未改动）
+- 真实 `pulse.db`：`PRAGMA user_version = 1`，唯一键已迁移为 `(date, title, keyword)`
+
+### 10.2 代码状态
+
+- P0 提交：`6ad6348`（并发锁、测试与 CI、UI 拆分、韧性、预警生命周期）
+- P1 提交：`2761520`（数据源注册表、跨关键词归属、情感口径、防幻觉、多关键词调度、增量抓取、日报）
+- 仅提交本地 `master`，**尚未 push 到 GitHub**
+- 除本次文档更新外工作区干净；`pulse.db`、`chroma_db/`、`reports/`、`.env` 均在 `.gitignore` 中
 
