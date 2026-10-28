@@ -71,7 +71,7 @@ def test_migration_widens_legacy_unique_key(tmp_path, monkeypatch):
     # 旧库里同标题只保留了一条，迁移后可再写入其他关键词
     assert database.save_items([make_item("同一标题", "大模型")]) == 1
     with database._connect() as c:
-        assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert c.execute("PRAGMA user_version").fetchone()[0] >= 1
 
 
 def test_filter_unseen_returns_only_new_items():

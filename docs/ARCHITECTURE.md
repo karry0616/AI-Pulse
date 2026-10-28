@@ -9,7 +9,7 @@
 
 ## 项目现状速览（交接用，2026-10-28）
 
-**一句话**：单机可运行的 AI 行业情报系统——RSS 抓取 → SQLite → Chroma 历史记忆 → Collector/Analyst/Critic 三 Agent → 预警人工审批 → Webhook 推送，每次 run 额外产出一份 Markdown 日报。
+**一句话**：单机可运行的 AI 行业情报系统——RSS 抓取 → SQLite → Chroma 历史记忆 → Collector/Analyst/Critic 三 Agent → 事件线归并 → 预警人工审批 → Webhook 推送，每次 run 额外产出一份 Markdown 日报。
 
 **模块职责**
 
@@ -20,14 +20,15 @@
 | `pipeline.py` | 一次 run 的总编排 + 跨进程运行锁 + 热度计算 + 日报导出 | 唯一入口，UI 与调度器都调它 |
 | `fetcher.py` | RSS 抓取、清洗、关键词匹配、规则情感（词边界匹配） | 只抓公开 RSS |
 | `sources.py` | 数据源 / 关键词 / 检索词 / 别名的唯一注册表 | **加源、加关键词只改这里** |
-| `database.py` | SQLite 四张表、`user_version` 迁移、去重、增量过滤、情感回写 | 所有 SQL 集中在此 |
+| `database.py` | SQLite 六张表、`user_version` 迁移、去重、增量过滤、情感回写、事件线 | 所有 SQL 集中在此 |
 | `reports.py` | Markdown 日报渲染与落盘 | 写 `reports/`，已 gitignore |
+| `events.py` | 事件线与实体追踪：多来源同一事件的标题相似度归并 | 纯规则，零 token 成本 |
 | `agents/` | `state` / `prompts` / `collector` / `analyst` / `critic` / `graph` | 60 行纯代码状态机，不依赖 LangGraph |
 | `llm/client.py` | DeepSeek JSON Mode、token 计量、429/5xx 退避重试 | 每次调用落 `llm_calls` |
 | `rag/store.py` · `rag/memory.py` | Chroma 向量记忆（失败 5 分钟冷却重试）+ 周同比 | 嵌入是字符 n-gram 哈希，离线可跑 |
 | `notify.py` | 钉钉 HMAC 加签 / 飞书卡片推送 | 只在人工审批后调用 |
 | `scheduler_service.py` | APScheduler 每天 08:00，多关键词串行 | 独立进程，复用运行锁 |
-| `tests/` | 58 个 pytest 用例 | CI：`.github/workflows/ci.yml` |
+| `tests/` | 63 个 pytest 用例 | CI：`.github/workflows/ci.yml` |
 
 **一次 run 的实际顺序（当前代码）**
 
@@ -44,6 +45,7 @@ pipeline.run(keyword, sources, trigger)
   → agents.graph.run()                   Collector → Analyst → Critic（≤3 次回边）
   → pipeline.compute_heat()              代码计算热度，覆盖模型值
   → database.update_sentiments()         Agent 判定情感回写数据库
+  → events.link_run()                    同事件多来源报道归并为事件线（纯规则）
   → [negative_alerts > 0] save_alert()   只暂存 pending，等待人工审批
   → reports.save()                       写 reports/YYYY-MM-DD-{keyword}.md
   → finish_run()                         回写 run_logs
@@ -51,7 +53,7 @@ pipeline.run(keyword, sources, trigger)
 推送不在本流程内：用户点「审核并发送」后走 pipeline.push_alert()
 ```
 
-**数据层（SQLite，WAL）**
+**数据层（SQLite，WAL，`user_version=2`）**
 
 | 表 | 用途 | 关键约束 |
 | --- | --- | --- |
@@ -59,6 +61,8 @@ pipeline.run(keyword, sources, trigger)
 | `run_logs` | 每次 run 的状态、条数、耗时、错误 | `run_id` 主键 |
 | `llm_calls` | 每次 LLM 调用的 token / 耗时 / 成败 | 按 `run_id + node` 可审计 |
 | `alerts` | 预警与审批状态 | `pending / sent / failed / expired` |
+| `event_threads` | 事件线：实体、首末日期、报道数 | `thread_key` 唯一（v2 新增） |
+| `event_links` | 事件线 ↔ 资讯明细 | `UNIQUE(thread_id, title)` 防重复计数（v2 新增） |
 
 **常用命令**
 
@@ -66,7 +70,8 @@ pipeline.run(keyword, sources, trigger)
 .\.venv\Scripts\streamlit.exe run app.py                       # 页面
 .\.venv\Scripts\python.exe pipeline.py --keyword "AI Agent"    # 手动跑一次
 .\.venv\Scripts\python.exe scheduler_service.py --now --keywords "大模型,RAG"
-.\.venv\Scripts\python.exe -m pytest -q                        # 58 个用例
+.\.venv\Scripts\python.exe events.py --keyword "AI Agent"             # 查看事件线
+.\.venv\Scripts\python.exe -m pytest -q                        # 63 个用例
 ```
 
 **设计约束（不要违背）**
@@ -82,7 +87,7 @@ pipeline.run(keyword, sources, trigger)
 - Streamlit 热重载不会刷新被 import 的模块，改 `ui/` 或非入口文件后需重启进程；
 - Python 解释器统一用 `.\.venv\Scripts\python.exe`，直接 `python` 可能不是虚拟环境。
 
-**当前完成度**：P0（5 项）与 P1（7 项）全部落地并验证（58 用例通过 + 一次真实端到端 run），P2（5 项）未开始。详见「十、实施进度」。
+**当前完成度**：P0（5 项）与 P1（7 项）全部落地并验证（58 用例通过 + 一次真实端到端 run）；P2-13（事件线与实体追踪）已完成（63 用例通过），P2 其余 4 项未开始。详见「十、实施进度」。
 
 ---
 
@@ -115,10 +120,11 @@ pipeline.run(keyword, sources, trigger)
 AI Pulse/
 ├── app.py                476 行   Streamlit 页面（KPI + 图表 + 轨迹 + HITL）
 ├── pipeline.py           323 行   一次 run 的总编排（运行锁 / 增量 / 热度 / 日报）
-├── database.py           591 行   SQLite 四张表 + 迁移 + 全部 SQL
+├── database.py           约 750 行 SQLite 六张表 + 迁移 + 全部 SQL
 ├── fetcher.py            225 行   RSS 抓取、清洗、关键词匹配、规则情感
 ├── sources.py             52 行   数据源 / 关键词 / 别名唯一注册表
 ├── reports.py             90 行   Markdown 日报导出
+├── events.py             170 行   事件线与实体追踪（标题相似度归并）
 ├── notify.py             137 行   钉钉加签 / 飞书卡片 Webhook
 ├── scheduler_service.py  110 行   APScheduler 每日 08:00 独立进程
 ├── config.py              33 行   自己写的 .env 加载器
@@ -225,6 +231,7 @@ pipeline.run(keyword, sources, trigger)                         # pipeline.py
 | 13 | 增量抓取 | `database.filter_unseen()` | ●●●●○ | 只把新条目送 LLM/RAG，无新增才回退近 1 天存档 |
 | 14 | 热度代码化 | `pipeline.compute_heat()` | ●●●●○ | 由条数 + 源数计算，覆盖模型自报值，杜绝随口报数 |
 | 15 | 日报导出 | `reports.py` | ●●●●○ | 每次 run 写 `reports/YYYY-MM-DD-{keyword}.md`（不入库） |
+| 16 | 事件线与实体追踪 | `events.py` · `database.py` | ●●●○○ | 标题相似度 + 实体命中归并多来源报道；纯规则、零 token，口径可解释 |
 
 ---
 
@@ -299,7 +306,7 @@ pipeline.run(keyword, sources, trigger)                         # pipeline.py
 | F1 | **多关键词任务** ✅ | scheduler 支持 `--keywords`，默认 4 个关键词串行；并行 job 未做 | ★★★★ | ★★ | 从「单关键词玩具」变成「真情报台」 |
 | F2 | **数据源注册表 + 扩源** ✅ | `sources.py` 唯一注册表；新增 arXiv / InfoQ / Solidot（Reddit 在当前网络不可达，未采用） | ★★★★★ | ★★ | 情报价值 = 覆盖率；已消灭 Twitter/X 幽灵源 |
 | F3 | **日报 / 周报导出** ✅（Markdown 部分） | 每次 run 自动写 `reports/YYYY-MM-DD-{keyword}.md`；PDF / 飞书文档、7 天周报未做 | ★★★★ | ★★ | 产出「能发出去的东西」 |
-| F4 | **事件线与实体追踪** | 相似新闻合并为同一事件，跟踪「公司-模型-融资/事故」时间线 | ★★★★★ | ★★★★ | 从「新闻摘要」升级为「事件跟踪」 |
+| F4 | **事件线与实体追踪** ✅（基础版） | 标题字符二元组相似度 + Collector 实体命中，把多来源同一事件归并为一条事件线并记录首末日期；事件级因果链（融资/事故/响应）未做 | ★★★★★ | ★★★★ | 从「新闻摘要」升级为「事件跟踪」 |
 | F5 | **预警规则中心** | 自定义负面词、阈值、z-score 热度突增检测 | ★★★★ | ★★★ | 降低误报 |
 | F6 | **飞书卡片回调审批** | 卡片带按钮，点「通过/驳回」直接改状态（需 FastAPI 回调端点） | ★★★ | ★★★ | 真正的移动端 HITL |
 
@@ -363,13 +370,13 @@ pipeline.run(keyword, sources, trigger)                         # pipeline.py
 11. ✅ 增量抓取（`filter_unseen`）
 12. ✅ 日报导出（`reports/*.md`）
 
-### P2 · 战略级（差异化与生态）— ⏳ 未开始
+### P2 · 战略级（差异化与生态）— ⏳ 进行中（13 已完成）
 
-13. 事件线与实体追踪
-14. API / MCP 化
-15. 鉴权 + 审计 + Docker / HTTPS 部署
-16. 飞书卡片回调审批
-17. 数据迁移 + 归档留存
+13. ✅ 事件线与实体追踪（标题相似度 + 实体命中归并；事件线表 v2）
+14. ⏳ API / MCP 化
+15. ⏳ 鉴权 + 审计 + Docker / HTTPS 部署
+16. ⏳ 飞书卡片回调审批
+17. ⏳ 数据迁移 + 归档留存
 
 ---
 
@@ -424,21 +431,25 @@ pipeline.run(keyword, sources, trigger)                         # pipeline.py
 | P1-10 | 多关键词调度 | ✅ 已完成（`--keywords` 逗号列表，默认全部关键词串行执行） |
 | P1-11 | 增量抓取 | ✅ 已完成（`filter_unseen` 只分析新条目，无新增回退近 1 天存档） |
 | P1-12 | 日报导出 | ✅ 已完成（`reports/YYYY-MM-DD-{keyword}.md`，目录已 gitignore） |
-| P2 | 13–17 项 | ⏳ 待开始 |
+| P2-13 | 事件线与实体追踪 | ✅ 已完成（`events.py` 规则归并；`event_threads` / `event_links` 两表，`user_version=2`；轨迹面板与日报新增事件线段落） |
+| P2 | 14–17 项 | ⏳ 待开始 |
 
 ### 10.1 验证记录（2026-10-28）
 
-- `pytest -q`：**58 passed**（critic / fetcher / database / llm client / rag store / pipeline lock / scheduler / reports / sources）
+- `pytest -q`：**63 passed**（critic / fetcher / database / llm client / rag store / pipeline lock / scheduler / reports / sources / events）
+- 事件线端到端（36Kr + Solidot + InfoQ）：11 条资讯归并为 11 条事件线，实体识别正常，日报含「事件线追踪」段落
+- `events.py --keyword "AI Agent"`：可读出事件线实体、报道数与首末日期
 - `compileall`：全部源码模块通过
 - 真实端到端 run（arXiv + InfoQ + 36Kr + Solidot）：抓取 14 条、入库 14 条，Critic 一次通过，
   `[GUARD] heat_score` 由代码修正为 1580（模型给 1520），预警落 `pending`，日报文件生成
 - Streamlit 启动：HTTP 200，`import app` 无异常（UI 布局未改动）
-- 真实 `pulse.db`：`PRAGMA user_version = 1`，唯一键已迁移为 `(date, title, keyword)`
+- 真实 `pulse.db`：`PRAGMA user_version = 2`（v1 唯一键迁移 + v2 事件线两表）
 
 ### 10.2 代码状态
 
 - P0 提交：`6ad6348`（并发锁、测试与 CI、UI 拆分、韧性、预警生命周期）
 - P1 提交：`2761520`（数据源注册表、跨关键词归属、情感口径、防幻觉、多关键词调度、增量抓取、日报）
-- 仅提交本地 `master`，**尚未 push 到 GitHub**
+- P2-13 提交：事件线与实体追踪（`events.py` + 事件线两表 + 轨迹/日报段落）
+- 本地 `master` 较 `origin/master` 领先 3 个提交，**GitHub 推送因本机无法连通 github.com:443 未完成**
 - 除本次文档更新外工作区干净；`pulse.db`、`chroma_db/`、`reports/`、`.env` 均在 `.gitignore` 中
 

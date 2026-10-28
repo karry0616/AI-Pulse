@@ -106,3 +106,37 @@ def render_trace(analysis: dict) -> None:
             f'<div class="trace-item">{escape(str(rag["comparison"]))}</div>',
             unsafe_allow_html=True,
         )
+
+    _render_threads(analysis.get("_event_threads") or {})
+
+
+def _render_threads(info: dict) -> None:
+    """事件线追踪：同一事件的多次报道归并成一条线。"""
+    threads = info.get("top") or []
+    st.markdown('<div class="trace-label">事件线追踪</div>', unsafe_allow_html=True)
+
+    if not threads:
+        st.markdown(
+            '<div class="trace-item trace-dim">本次未形成事件线（首次采集或资讯互不相关）</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    rows = "".join(
+        f'<div class="trace-item">'
+        f'<span class="trace-dim">[{escape(str(thread.get("last_date") or "-"))}]</span> '
+        f'{escape(str(thread.get("title", ""))[:60])} '
+        f'<span class="trace-dim">· {escape(str(thread.get("entity") or "未识别实体"))} · '
+        f'{int(thread.get("item_count") or 0)} 篇报道</span></div>'
+        for thread in threads[:5]
+    )
+    summary = (
+        f'本次归并 {int(info.get("linked") or 0)} 条资讯到 '
+        f'{int(info.get("threads") or 0)} 条事件线'
+        f'（新建 {int(info.get("new") or 0)} 条 · 活跃窗口 {int(info.get("window_days") or 7)} 天）'
+    )
+    st.markdown(rows, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="trace-item trace-dim">{escape(summary)}</div>',
+        unsafe_allow_html=True,
+    )

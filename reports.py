@@ -41,6 +41,10 @@ def render(
 
 {analysis.get("top_news", "-")}
 
+## 事件线追踪
+
+{thread_lines(analysis.get("_event_threads") or {})}
+
 ## 成熟度
 
 {analysis.get("maturity", "-")}
@@ -66,6 +70,21 @@ def alert_line_display(alert_id: int | None, level: str, warning_text: str) -> s
     if alert_id:
         return f"> {level} · 预警 #{alert_id} 等待人工审核\n\n{warning_text}"
     return warning_text or "暂无高风险事件"
+
+
+def thread_lines(info: dict) -> str:
+    """事件线追踪段落：同一事件的多来源报道归并成一条时间线。"""
+    threads = info.get("top") or []
+    if not threads:
+        return "暂无事件线（首次采集或资讯互不相关）"
+
+    lines = [
+        f"- **{thread.get('title', '-')}** · 实体 {thread.get('entity') or '未识别'}"
+        f" · {int(thread.get('item_count') or 0)} 篇报道"
+        f" · {thread.get('first_date') or '-'} → {thread.get('last_date') or '-'}"
+        for thread in threads[:5]
+    ]
+    return "\n".join(lines)
 
 
 def save(

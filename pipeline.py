@@ -15,6 +15,7 @@ from pathlib import Path
 
 import config
 import database
+import events
 import fetcher
 import notify
 import reports
@@ -189,6 +190,8 @@ def _run_once(
         updated = database.update_sentiments(analysis.get("_events_detail") or [], keyword)
         if updated:
             log(f"[SENTIMENT] 已用 Agent 判定回写 {updated} 条资讯情感")
+
+        analysis["_event_threads"] = events.link_run(analysis_items, analysis, keyword, log=log)
 
         alert_id: int | None = None
         level = ""

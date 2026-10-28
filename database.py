@@ -71,6 +71,30 @@ CREATE TABLE IF NOT EXISTS alerts (
     sent_at      TEXT,
     push_result  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS event_threads (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_key       TEXT NOT NULL UNIQUE,
+    keyword          TEXT NOT NULL,
+    entity           TEXT,
+    title            TEXT NOT NULL,
+    first_date       TEXT,
+    last_date        TEXT,
+    item_count       INTEGER DEFAULT 0,
+    latest_sentiment TEXT,
+    updated_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS event_links (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL,
+    date      TEXT,
+    title     TEXT NOT NULL,
+    source    TEXT,
+    sentiment TEXT,
+    created_at TEXT,
+    UNIQUE(thread_id, title)
+);
 """
 
 
@@ -133,12 +157,19 @@ def init_db() -> None:
         if version < 1:
             _migrate_daily_intel_unique(conn)
             conn.execute("PRAGMA user_version = 1")
+        if version < 2:
+            # v2 只新增事件线两张表（SCHEMA 已建），无需搬数据
+            conn.execute("PRAGMA user_version = 2")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_date ON daily_intel(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_keyword ON daily_intel(keyword)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_title ON daily_intel(title)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_llm_run ON llm_calls(run_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_run ON alerts(run_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_status ON alerts(status)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thread_kw_last ON event_threads(keyword, last_date)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_link_thread ON event_links(thread_id)")
 
 
 def save_items(items: list[dict]) -> int:
@@ -589,3 +620,132 @@ def negative_ratio_on(day: str, keyword: str | None = None) -> float | None:
     if not total:
         return None
     return round(counts.get("negative", 0) / total * 100, 1)
+
+
+# ---------------------------------------------------------------------------
+# 事件线与实体追踪
+# ---------------------------------------------------------------------------
+def recent_threads(keyword: str, days: int = 7, limit: int = 200) -> list[dict]:
+    """取近 N 天仍在更新的同关键词事件线，供归并时匹配。"""
+    since = (date.today() - timedelta(days=days)).isoformat()
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM event_threads
+             WHERE keyword = ? AND COALESCE(last_date, first_date, '') >= ?
+             ORDER BY last_date DESC, id DESC
+             LIMIT ?
+            """,
+            (keyword, since, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_thread(
+    thread_key: str,
+    keyword: str,
+    title: str,
+    day: str,
+    entity: str = "",
+    sentiment: str = "neutral",
+) -> int:
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM event_threads WHERE thread_key = ?", (thread_key,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE event_threads SET last_date = ?, updated_at = ? WHERE id = ?",
+                (day, _now(), int(existing["id"])),
+            )
+            return int(existing["id"])
+
+        cursor = conn.execute(
+            """
+            INSERT INTO event_threads
+                (thread_key, keyword, entity, title, first_date, last_date,
+                 item_count, latest_sentiment, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (thread_key, keyword, entity, title, day, day, sentiment, _now()),
+        )
+        return int(cursor.lastrowid)
+
+
+def touch_thread(
+    thread_id: int,
+    day: str,
+    sentiment: str,
+    entity: str = "",
+) -> None:
+    """事件线有新报道时推进 last_date 与计数。"""
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE event_threads
+               SET last_date = CASE WHEN COALESCE(last_date, '') > ? THEN last_date ELSE ? END,
+                   item_count = item_count + 1,
+                   latest_sentiment = ?,
+                   entity = CASE WHEN COALESCE(entity, '') = '' THEN ? ELSE entity END,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (day, day, sentiment, entity, _now(), thread_id),
+        )
+
+
+def link_thread_item(thread_id: int, item: dict) -> bool:
+    """把一条资讯挂到事件线；重复标题返回 False，避免重复计数。"""
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO event_links
+                (thread_id, date, title, source, sentiment, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                thread_id,
+                str(item.get("date") or date.today().isoformat()),
+                str(item.get("title") or ""),
+                str(item.get("source") or ""),
+                str(item.get("sentiment") or "neutral"),
+                _now(),
+            ),
+        )
+        return bool(cursor.rowcount)
+
+
+def top_threads(keyword: str | None = None, days: int = 7, limit: int = 5) -> list[dict]:
+    """按报道数排序的事件线，供页面与日报展示。"""
+    since = (date.today() - timedelta(days=days)).isoformat()
+    sql = """
+        SELECT id, entity, title, first_date, last_date, item_count, latest_sentiment
+          FROM event_threads
+         WHERE COALESCE(last_date, first_date, '') >= ?
+    """
+    params: list = [since]
+    if keyword:
+        sql += " AND keyword = ?"
+        params.append(keyword)
+    sql += " ORDER BY item_count DESC, last_date DESC, id DESC LIMIT ?"
+    params.append(limit)
+
+    with _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def thread_timeline(thread_id: int, limit: int = 20) -> list[dict]:
+    """一条事件线内按日期倒序的报道明细。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT date, title, source, sentiment
+              FROM event_links
+             WHERE thread_id = ?
+             ORDER BY date DESC, id DESC
+             LIMIT ?
+            """,
+            (thread_id, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]

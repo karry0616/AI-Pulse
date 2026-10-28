@@ -149,7 +149,11 @@ def finalize(state: AgentState) -> dict:
         "_issues": list(last_issues),
         "_events": len(state.events),
         "_events_detail": [
-            {"title": event.get("title", ""), "sentiment": event.get("sentiment", "neutral")}
+            {
+                "title": event.get("title", ""),
+                "sentiment": event.get("sentiment", "neutral"),
+                "entities": list(event.get("entities") or [])[:5],
+            }
             for event in state.events
         ],
         "_run_id": state.run_id,
