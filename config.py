@@ -14,7 +14,14 @@ from pathlib import Path
 
 # 启动自检：必填缺失直接告警，可选缺失只提示降级
 REQUIRED_KEYS = ("DEEPSEEK_API_KEY",)
-OPTIONAL_KEYS = ("WEBHOOK_URL", "DINGTALK_SECRET", "PUBLIC_BASE_URL")
+OPTIONAL_KEYS = (
+    "WEBHOOK_URL",
+    "DINGTALK_SECRET",
+    "PUBLIC_BASE_URL",
+    "API_TOKEN",
+    "FEISHU_VERIFICATION_TOKEN",
+    "FEISHU_ENCRYPT_KEY",
+)
 
 
 def load_env(path: str | Path | None = None) -> None:

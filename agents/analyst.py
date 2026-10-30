@@ -3,21 +3,10 @@
 from __future__ import annotations
 
 from llm import client
+from sentiment import guess_sentiment
 
 from . import prompts
 from .state import AgentState
-
-NEGATIVE_WORDS = [
-    "layoff", "lawsuit", "leak", "breach", "outage", "fine", "ban", "risk",
-    "vulnerability", "scandal", "shutdown", "downturn", "controversy",
-    "裁员", "泄露", "诉讼", "漏洞", "风险", "处罚", "封禁", "宕机", "争议", "下滑",
-]
-
-POSITIVE_WORDS = [
-    "launch", "funding", "raises", "breakthrough", "partnership", "record",
-    "surge", "release", "open-source", "wins", "growth",
-    "发布", "融资", "突破", "增长", "合作", "开源", "上线",
-]
 
 FALLBACK_MATURITY = """| 方向 | 成熟度 | 阶段判断 |
 | :--- | :--- | :--- |
@@ -31,8 +20,8 @@ def fallback(state: AgentState, reason: str, log=print) -> dict:
     """无 Key / API 失败时的规则结果，保证前端永远有数据。"""
     titles = state.titles
     total = len(titles)
-    negatives = [t for t in titles if any(word in t.lower() for word in NEGATIVE_WORDS)]
-    positives = [t for t in titles if any(word in t.lower() for word in POSITIVE_WORDS)]
+    negatives = [t for t in titles if guess_sentiment(t) == "negative"]
+    positives = [t for t in titles if guess_sentiment(t) == "positive"]
     negative_hits, positive_hits = len(negatives), len(positives)
 
     heat = max(800, min(2000, 820 + 70 * min(total, 15)))

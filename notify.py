@@ -19,6 +19,8 @@ import requests
 import config
 
 WEBHOOK_TIMEOUT = 10
+WEBHOOK_RETRIES = 2          # 失败后的重试次数（首次之外）
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 @dataclass
@@ -159,26 +161,38 @@ def send_webhook(
         target = sign_dingtalk(target, secret)
 
     markdown = build_markdown(warning_text, keyword, heat_score)
+    payload = _payload(target, markdown, alert_id)
 
-    try:
-        resp = requests.post(
-            target, json=_payload(target, markdown, alert_id), timeout=WEBHOOK_TIMEOUT
-        )
-    except requests.RequestException as exc:
-        log(f"[WARN] Webhook 推送失败：{type(exc).__name__}")
-        return PushResult(False, channel, type(exc).__name__)
+    attempts = WEBHOOK_RETRIES + 1
+    last_error = ""
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(min(0.5 * attempt, 2.0))
+        try:
+            resp = requests.post(target, json=payload, timeout=WEBHOOK_TIMEOUT)
+        except requests.RequestException as exc:
+            last_error = type(exc).__name__
+            if attempt + 1 < attempts:
+                log(f"[WARN] Webhook 推送失败（{last_error}），第 {attempt + 1} 次重试")
+            continue
 
-    try:
-        body = resp.json()
-    except ValueError:
-        body = {}
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
 
-    codes = [body.get(key) for key in ("code", "errcode", "StatusCode") if key in body]
-    ok = resp.status_code == 200 and all(code == 0 for code in codes)
+        codes = [body.get(key) for key in ("code", "errcode", "StatusCode") if key in body]
+        ok = resp.status_code == 200 and all(code == 0 for code in codes)
 
-    if ok:
-        log(f"[OK] Webhook 推送成功（{channel}）")
-        return PushResult(True, channel, f"HTTP {resp.status_code}")
+        if ok:
+            log(f"[OK] Webhook 推送成功（{channel}，第 {attempt + 1} 次尝试）")
+            return PushResult(True, channel, f"HTTP {resp.status_code}")
 
-    log(f"[WARN] Webhook 推送失败：HTTP {resp.status_code}，响应 {body}")
-    return PushResult(False, channel, f"HTTP {resp.status_code} {body}")
+        last_error = f"HTTP {resp.status_code} {body}"
+        if resp.status_code not in RETRYABLE_STATUS or attempt + 1 >= attempts:
+            log(f"[WARN] Webhook 推送失败：{last_error}")
+            return PushResult(False, channel, last_error)
+        log(f"[WARN] Webhook 返回 {resp.status_code}，第 {attempt + 1} 次重试")
+
+    log(f"[WARN] Webhook 推送失败：{last_error}")
+    return PushResult(False, channel, last_error)

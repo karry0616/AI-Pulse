@@ -1,0 +1,20 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [".venv", "chroma_db", "reports", "logs", "简历优化", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# 中文注释与 Prompt 文案天然偏长，行长交给编辑器处理
+ignore = ["E501"]
+
+[tool.coverage.run]
+source = ["."]
+omit = [".venv/*", "tests/*", "chroma_db/*", "reports/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

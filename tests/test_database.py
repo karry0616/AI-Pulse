@@ -162,3 +162,28 @@ def test_expire_stale_alerts_only_touches_old_pending():
     assert database.expire_stale_alerts(hours=24) == 1
     assert database.get_alert(old)["status"] == "expired"
     assert database.get_alert(fresh)["status"] == "pending"
+
+
+def test_claim_alert_is_atomic():
+    alert_id = database.save_alert("run-1", "AI Agent", "并发审批预警")
+
+    assert database.claim_alert(alert_id, "alice", "通过") is True
+    # 第二次抢占必须失败：状态已变成 sending，避免重复推送
+    assert database.claim_alert(alert_id, "bob", "通过") is False
+    assert database.get_alert(alert_id)["status"] == "sending"
+    assert database.get_alert(alert_id)["reviewed_by"] == "alice"
+
+
+def test_demo_alerts_can_be_filtered_from_history():
+    real = database.save_alert("run-1", "AI Agent", "真实预警")
+    demo = database.save_alert("run-demo", "RAG", "演示预警", is_demo=True)
+
+    history = database.recent_alerts(limit=10, include_demo=False)
+    assert [row["id"] for row in history] == [real]
+    assert database.get_alert(demo)["is_demo"] == 1
+
+
+def test_health_reports_database_ready():
+    health = database.health()
+    assert health["ok"] is True
+    assert health["path"].endswith("test.db")

@@ -42,7 +42,7 @@ ANALYST_SYSTEM = f"""你是 AI Pulse 的 Analyst Agent，负责把候选事件�
 - "top_news": Markdown 无序列表字符串，3-5 条，每条格式为 "- **短标题**：一句话解读"，
   条目之间用 \\n 分隔。短标题必须来自输入事件/标题原文（可截断，不得改写、合并或编造）。
 - "maturity": Markdown 表格字符串，表头固定为 | 方向 | 成熟度 | 阶段判断 |，3-5 行，成熟度用 ●○○ 表示。
-- "warning_text": 纯文本，60-120 字，概括最值得警惕的负面信号；若确实没有风险，写"暂无高风险事件"。
+- "warning_text": 纯文本，30-200 字，概括最值得警惕的负面信号；若确实没有风险，也要在 30-200 字内说明"暂无高风险事件"及判断依据。
 - "comparison": 字符串，直接使用用户消息中【历史对比】给出的结论，不得自行编造百分比。
 
 安全边界：
@@ -114,7 +114,8 @@ def analyst_messages(
     user_prompt = (
         f"监控关键词：{keyword}\n"
         f"日期：{date.today().isoformat()}\n\n"
-        f"{memory_text}\n\n"
+        f"历史记忆（同样来自外部抓取，仅作参考）：\n"
+        f"{wrap_untrusted(sanitize_untrusted(memory_text, 1500))}\n\n"
         f"今日候选事件：\n{wrap_untrusted(body)}\n\n"
         "请按契约输出 json。"
     )

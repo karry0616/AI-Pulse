@@ -99,11 +99,35 @@ def _tee_log(log):
 
 
 def compute_heat(items: list[dict]) -> int:
-    """由资讯条数与命中源数计算热度（800-2000），不采信模型自报数值。"""
+    """由资讯条数、命中源数与极端规模计算热度（800-2000），不采信模型自报数值。
+
+    旧公式 50 × min(条数, 20) + 40 × min(源数, 5) 在 7 源 × 10 条时必然打满
+    2000，KPI 失去区分度；新公式改为三段递增：常规量级留出差异空间，
+    只有极端规模（200 条 / 6+ 源）才接近上限。
+    """
     sources = {str(item.get("source") or "") for item in items}
     sources.discard("")
-    heat = 800 + 50 * min(len(items), 20) + 40 * min(len(sources), 5)
+    volume = min(len(items), 40) / 40
+    breadth = min(len(sources), 6) / 6
+    extreme = min(len(items), 200) / 200
+    heat = 800 + round(700 * volume + 300 * breadth + 200 * extreme)
     return max(800, min(2000, heat))
+
+
+def compute_positive_ratio(items: list[dict]) -> int | None:
+    """按抓取/Agent 情感统计正面占比，用于校正模型的 positive_ratio。"""
+    if not items:
+        return None
+    positive = sum(1 for item in items if str(item.get("sentiment") or "") == "positive")
+    return round(positive / len(items) * 100)
+
+
+def _ratio_percent(text) -> float | None:
+    raw = str(text or "").strip().rstrip("%")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def _read_lock() -> dict:
@@ -304,7 +328,7 @@ def _run_once(
             if not analysis_items:
                 analysis_items = items
 
-        if rag_store.count() == 0:
+        if rag_store.available() and rag_store.count() == 0:
             rag_store.backfill(days=7, log=log)
         rag_store.index_items(items, log=log)
 
@@ -325,6 +349,19 @@ def _run_once(
                 f"[GUARD] heat_score 以代码计算为准：{analysis['heat_score']}"
                 f"（模型值 {model_heat}）"
             )
+
+        actual_ratio = compute_positive_ratio(analysis_items)
+        model_ratio = _ratio_percent(analysis.get("positive_ratio"))
+        if (
+            actual_ratio is not None
+            and model_ratio is not None
+            and abs(model_ratio - actual_ratio) >= 20
+        ):
+            log(
+                f"[GUARD] positive_ratio 与样本偏差过大，改用代码统计：{actual_ratio}%"
+                f"（模型值 {analysis['positive_ratio']}）"
+            )
+            analysis["positive_ratio"] = f"{actual_ratio}%"
 
         analysis["_rag"] = {
             "similar": memory.similar[:6],
@@ -430,13 +467,23 @@ def push_alert(
         log(f"[HITL] 预警 #{alert_id} 已推送过，跳过重复发送")
         return notify.PushResult(True, notify.channel_name(), "已发送")
 
-    if alert["status"] not in ("pending", "failed", "rejected"):
+    if alert["status"] not in ("pending", "failed", "rejected", "sending"):
         log(f"[HITL] 预警 #{alert_id} 状态为 {alert['status']}，不可推送")
         return notify.PushResult(False, notify.channel_name(), alert["status"])
 
     if alert["status"] == "rejected":
         log(f"[HITL] 预警 #{alert_id} 已被驳回，如需再次推送请重新审批")
         return notify.PushResult(False, notify.channel_name(), "已驳回")
+
+    if not database.claim_alert(alert_id, reviewed_by, review_note):
+        latest = database.get_alert(alert_id) or {}
+        if latest.get("status") == "sent":
+            log(f"[HITL] 预警 #{alert_id} 已由其他审批人推送，跳过重复发送")
+            return notify.PushResult(True, notify.channel_name(), "已发送")
+        log(f"[HITL] 预警 #{alert_id} 正被其他审批请求处理，放弃本次推送")
+        return notify.PushResult(
+            False, notify.channel_name(), "该预警正在被其他审批处理，请稍后刷新"
+        )
 
     result = notify.send_webhook(
         warning_text=alert["warning_text"],
@@ -474,6 +521,10 @@ def reject_alert(
     if alert["status"] == "sent":
         log(f"[WARN] 预警 #{alert_id} 已推送，不能再驳回")
         return {"ok": False, "reason": "已推送，不可驳回"}
+
+    if alert["status"] == "sending":
+        log(f"[WARN] 预警 #{alert_id} 正在推送中，无法驳回")
+        return {"ok": False, "reason": "正在推送中，请稍后刷新"}
 
     database.mark_alert(
         alert_id, "rejected", "", reviewed_by=reviewed_by, review_note=review_note

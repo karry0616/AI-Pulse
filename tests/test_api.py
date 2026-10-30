@@ -1,5 +1,6 @@
 """HTTP API 测试：起真实本地服务，用 http 请求验证各端点。"""
 
+import hashlib
 import json
 import threading
 import urllib.error
@@ -43,13 +44,19 @@ def base_url():
     thread.join(timeout=5)
 
 
-def call(base: str, path: str, method: str = "GET", body: dict | None = None):
+def call(
+    base: str,
+    path: str,
+    method: str = "GET",
+    body: dict | None = None,
+    headers: dict | None = None,
+):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(
         f"{base}{path}",
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as resp:
@@ -284,3 +291,78 @@ def test_feishu_card_reject_marks_status(base_url):
 def test_feishu_callback_without_alert_id_returns_400(base_url):
     status, body = call(base_url, "/api/callback/feishu", "POST", {"action": {"value": {}}})
     assert status == 400
+
+
+# ---------------------------------------------------------------------------
+# 鉴权 / 参数校验 / 就绪检查
+# ---------------------------------------------------------------------------
+def test_api_token_is_enforced_when_configured(base_url, monkeypatch):
+    monkeypatch.setenv("API_TOKEN", "secret-token")
+
+    status, _ = call(base_url, "/api/status")
+    assert status == 401
+
+    status, body = call(base_url, "/api/status", headers={"X-API-Token": "secret-token"})
+    assert status == 200 and body["ok"] is True
+
+    # 健康检查始终公开，供容器探针使用
+    assert call(base_url, "/api/health")[0] == 200
+
+
+def test_api_token_accepts_bearer_scheme(base_url, monkeypatch):
+    monkeypatch.setenv("API_TOKEN", "secret-token")
+    status, body = call(
+        base_url, "/api/status", headers={"Authorization": "Bearer secret-token"}
+    )
+    assert status == 200 and body["ok"] is True
+
+
+def test_invalid_query_param_returns_400(base_url):
+    status, body = call(base_url, "/api/intel?days=abc")
+    assert status == 400 and "days" in body["error"]
+
+    status, body = call(base_url, "/api/alerts?limit=0")
+    assert status == 400 and "limit" in body["error"]
+
+
+def test_health_reports_component_status(base_url):
+    status, body = call(base_url, "/api/health")
+    assert status == 200
+    assert body["db"]["ok"] is True
+    assert "rag" in body and "lock" in body
+
+
+def test_async_run_returns_409_when_lock_is_alive(base_url, monkeypatch):
+    monkeypatch.setattr(pipeline, "cooldown_remaining", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline, "lock_status", lambda: {"alive": True, "pid": 1234})
+
+    status, body = call(base_url, "/api/run", "POST", {"keyword": "AI Agent"})
+    assert status == 409 and body["ok"] is False
+
+
+def test_feishu_signature_is_verified(base_url, monkeypatch):
+    monkeypatch.setenv("FEISHU_ENCRYPT_KEY", "enc-key")
+    alert_id = database.save_alert("run-1", "AI Agent", "预警文案")
+    payload = {"action": {"value": {"action": "reject", "alert_id": str(alert_id)}}}
+    raw = json.dumps(payload).encode("utf-8")
+
+    status, _ = call(base_url, "/api/callback/feishu", "POST", payload)
+    assert status == 403
+
+    timestamp, nonce = "1700000000", "abc123"
+    signature = hashlib.sha256(
+        (timestamp + nonce + "enc-key").encode("utf-8") + raw
+    ).hexdigest()
+    status, body = call(
+        base_url,
+        "/api/callback/feishu",
+        "POST",
+        payload,
+        headers={
+            "X-Lark-Request-Timestamp": timestamp,
+            "X-Lark-Request-Nonce": nonce,
+            "X-Lark-Signature": signature,
+        },
+    )
+    assert status == 200 and body["ok"] is True
+    assert database.get_alert(alert_id)["status"] == "rejected"

@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import re
 import sys
 from datetime import date
 
 import database
+from textutils import bigrams, normalize
 
 WINDOW_DAYS = 7          # 事件线的活跃窗口：超过 7 天未更新的线不再参与归并
 SIMILARITY = 0.5         # 标题相似度阈值（字符二元组 Jaccard）
@@ -22,14 +22,11 @@ MIN_SHARED_GRAMS = 3     # 至少共享的二元组数量，防止短标题被�
 
 def _norm(text) -> str:
     """去掉空白与标点、统一大小写。"""
-    return re.sub(r"[^\w]+", "", str(text or "")).lower()
+    return normalize(text)
 
 
 def _bigrams(text: str) -> set[str]:
-    cleaned = _norm(text)
-    if len(cleaned) < 2:
-        return {cleaned} if cleaned else set()
-    return {cleaned[i : i + 2] for i in range(len(cleaned) - 1)}
+    return bigrams(text)
 
 
 def _title_score(left: str, right: str) -> float:

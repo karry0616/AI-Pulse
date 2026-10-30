@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sqlite3
 import sys
 from contextlib import contextmanager
@@ -17,9 +16,20 @@ from pathlib import Path
 
 import pandas as pd
 
+from textutils import normalize
+
 _ROOT = Path(__file__).resolve().parent
-# 容器部署时用 PULSE_DB_PATH 指向挂载卷；本地默认仍在项目根目录
-DB_PATH = Path(os.getenv("PULSE_DB_PATH") or (_ROOT / "pulse.db"))
+# 测试可覆盖 DB_PATH；为 None 时按 PULSE_DB_PATH / 项目根目录实时解析，
+# 避免在 config.load_env() 之前 import 就把路径定死。
+DB_PATH: Path | None = None
+
+
+def db_path() -> Path:
+    if DB_PATH is not None:
+        return Path(DB_PATH)
+    env_path = os.getenv("PULSE_DB_PATH")
+    return Path(env_path) if env_path else (_ROOT / "pulse.db")
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_intel (
@@ -77,7 +87,8 @@ CREATE TABLE IF NOT EXISTS alerts (
     sent_at      TEXT,
     push_result  TEXT,
     reviewed_by  TEXT,
-    review_note  TEXT
+    review_note  TEXT,
+    is_demo      INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS event_threads (
@@ -143,7 +154,7 @@ CREATE TABLE IF NOT EXISTS llm_calls_archive (
 
 @contextmanager
 def _connect():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(db_path(), timeout=10)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -200,6 +211,13 @@ def _migrate_v3_review_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE alerts ADD COLUMN review_note TEXT")
 
 
+def _migrate_v4_demo_column(conn: sqlite3.Connection) -> None:
+    """v4：alerts 增加 is_demo 标记，演示数据不再混入真实误报率统计。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(alerts)").fetchall()}
+    if "is_demo" not in columns:
+        conn.execute("ALTER TABLE alerts ADD COLUMN is_demo INTEGER DEFAULT 0")
+
+
 def init_db() -> None:
     """建表 + 迁移 + 索引，可重复调用。"""
     with _connect() as conn:
@@ -216,6 +234,10 @@ def init_db() -> None:
             # v3：审批审计字段 + 分析结果持久化表 + 归档表（后两张 SCHEMA 已建）
             _migrate_v3_review_columns(conn)
             conn.execute("PRAGMA user_version = 3")
+        if version < 4:
+            # v4：演示预警标记，避免污染真实误报率统计
+            _migrate_v4_demo_column(conn)
+            conn.execute("PRAGMA user_version = 4")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_date ON daily_intel(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_keyword ON daily_intel(keyword)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_title ON daily_intel(title)")
@@ -292,7 +314,7 @@ def filter_unseen(items: list[dict]) -> list[dict]:
 
 def _norm_title(text: str) -> str:
     """去空白与标点、统一大小写，用于跨来源标题对齐。"""
-    return re.sub(r"[^\w]+", "", str(text or "")).lower()
+    return normalize(text)
 
 
 def update_sentiments(events: list[dict], keyword: str) -> int:
@@ -571,8 +593,10 @@ def save_alert(
     warning_text: str,
     level: str = "LOW",
     heat_score: int | None = None,
+    is_demo: bool = False,
 ) -> int:
     """写入待审批预警；同 keyword 当天已有待审/失败任务时复用并更新内容。"""
+    flag = 1 if is_demo else 0
     with _connect() as conn:
         existing = conn.execute(
             """
@@ -590,20 +614,20 @@ def save_alert(
                 """
                 UPDATE alerts
                    SET run_id = ?, level = ?, heat_score = ?, warning_text = ?,
-                       status = 'pending'
+                       status = 'pending', is_demo = ?
                  WHERE id = ?
                 """,
-                (run_id, level, heat_score, warning_text, alert_id),
+                (run_id, level, heat_score, warning_text, flag, alert_id),
             )
             return alert_id
 
         cursor = conn.execute(
             """
             INSERT INTO alerts
-                (run_id, keyword, level, heat_score, warning_text, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                (run_id, keyword, level, heat_score, warning_text, status, created_at, is_demo)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (run_id, keyword, level, heat_score, warning_text, _now()),
+            (run_id, keyword, level, heat_score, warning_text, _now(), flag),
         )
         return int(cursor.lastrowid)
 
@@ -679,6 +703,72 @@ def mark_alert(
         )
 
 
+def claim_alert(
+    alert_id: int,
+    reviewed_by: str = "",
+    review_note: str = "",
+    stale_minutes: int = 10,
+) -> bool:
+    """原子抢占一条预警准备推送。
+
+    只有 pending / failed（或超过 stale_minutes 卡在 sending 的残留）能被抢到，
+    并发审批时只有一个请求会返回 True，避免同一条预警被推送两次。
+    """
+    stale_cutoff = (
+        datetime.now() - timedelta(minutes=stale_minutes)
+    ).isoformat(timespec="seconds")
+    with _connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE alerts
+               SET status = 'sending', reviewed_at = ?,
+                   reviewed_by = CASE WHEN ? <> '' THEN ? ELSE reviewed_by END,
+                   review_note = CASE WHEN ? <> '' THEN ? ELSE review_note END
+             WHERE id = ?
+               AND (status IN ('pending', 'failed')
+                    OR (status = 'sending' AND COALESCE(reviewed_at, '') < ?))
+            """,
+            (
+                reviewed_by,
+                reviewed_by,
+                reviewed_by,
+                review_note,
+                review_note,
+                alert_id,
+                stale_cutoff,
+            ),
+        )
+        return bool(cursor.rowcount)
+
+
+def recent_alerts(
+    limit: int = 10,
+    keyword: str | None = None,
+    status: str | None = None,
+    include_demo: bool = True,
+) -> list[dict]:
+    """审批历史：按时间倒序返回预警，供页面与 API 回看审计记录。"""
+    conditions = ["1=1"]
+    params: list = []
+    if keyword:
+        conditions.append("keyword = ?")
+        params.append(keyword)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if not include_demo:
+        conditions.append("COALESCE(is_demo, 0) = 0")
+
+    sql = (
+        "SELECT * FROM alerts WHERE "
+        + " AND ".join(conditions)
+        + " ORDER BY id DESC LIMIT ?"
+    )
+    with _connect() as conn:
+        rows = conn.execute(sql, [*params, limit]).fetchall()
+    return [dict(row) for row in rows]
+
+
 def recent_runs(limit: int = 10) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
@@ -687,10 +777,12 @@ def recent_runs(limit: int = 10) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def negative_ratio_on(day: str, keyword: str | None = None) -> float | None:
-    """指定日期的负面占比（0-100），无数据返回 None。"""
-    sql = "SELECT sentiment, COUNT(*) AS n FROM daily_intel WHERE date = ?"
-    params: list = [day]
+def negative_ratio_between(
+    start: str, end: str, keyword: str | None = None
+) -> float | None:
+    """闭区间 [start, end] 的负面占比（0-100），无数据返回 None。"""
+    sql = "SELECT sentiment, COUNT(*) AS n FROM daily_intel WHERE date BETWEEN ? AND ?"
+    params: list = [start, end]
     if keyword:
         sql += " AND keyword = ?"
         params.append(keyword)
@@ -704,6 +796,21 @@ def negative_ratio_on(day: str, keyword: str | None = None) -> float | None:
     if not total:
         return None
     return round(counts.get("negative", 0) / total * 100, 1)
+
+
+def negative_ratio_on(day: str, keyword: str | None = None) -> float | None:
+    """指定日期的负面占比（0-100），无数据返回 None。"""
+    return negative_ratio_between(day, day, keyword)
+
+
+def health() -> dict:
+    """数据库连通性检查，供 API readiness 使用。"""
+    try:
+        with _connect() as conn:
+            conn.execute("SELECT 1 FROM daily_intel LIMIT 1")
+        return {"ok": True, "path": str(db_path())}
+    except Exception as exc:
+        return {"ok": False, "path": str(db_path()), "error": f"{type(exc).__name__}: {exc}"}
 
 
 # ---------------------------------------------------------------------------

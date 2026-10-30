@@ -1,12 +1,14 @@
 services:
-  # 页面：默认只绑本机回环，未做鉴权前不要直接暴露到公网
+  # 页面：默认只绑本机回环，未配置 API_TOKEN 前不要直接暴露到公网
   ui:
     build: .
     container_name: ai-pulse-ui
     env_file: .env
     environment:
+      TZ: Asia/Shanghai
       PULSE_DB_PATH: /data/pulse.db
       PULSE_LOG_DIR: /data/logs
+      PULSE_CHROMA_DIR: /data/chroma
     ports:
       - "127.0.0.1:8501:8501"
     volumes:
@@ -20,18 +22,22 @@ services:
     restart: unless-stopped
 
   # HTTP API：供外部系统触发 run / 查询情报 / 飞书卡片回调
+  # 公网暴露时务必在 .env 里设置 API_TOKEN，否则任何能访问端口的人都能触发任务
   api:
     build: .
     container_name: ai-pulse-api
     command: ["python", "api.py", "--host", "0.0.0.0", "--port", "8502"]
     env_file: .env
     environment:
+      TZ: Asia/Shanghai
       PULSE_DB_PATH: /data/pulse.db
       PULSE_LOG_DIR: /data/logs
+      PULSE_CHROMA_DIR: /data/chroma
     ports:
       - "127.0.0.1:8502:8502"
     volumes:
       - pulse-data:/data
+      - ./reports:/app/reports
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8502/api/health"]
       interval: 30s
@@ -47,10 +53,13 @@ services:
     profiles: ["sched"]
     env_file: .env
     environment:
+      TZ: Asia/Shanghai
       PULSE_DB_PATH: /data/pulse.db
       PULSE_LOG_DIR: /data/logs
+      PULSE_CHROMA_DIR: /data/chroma
     volumes:
       - pulse-data:/data
+      - ./reports:/app/reports
     restart: unless-stopped
 
   # HTTPS 反向代理：profile: https，证书由 Caddy 自动申请

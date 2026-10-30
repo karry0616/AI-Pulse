@@ -19,12 +19,19 @@ class MemoryContext:
     mode: str = "none"
 
 
+def _window_ratio(keyword: str, end: date, days: int = 7) -> float | None:
+    """一段连续窗口（含 end 当天）的负面占比，样本比单日更稳。"""
+    start = end - timedelta(days=days - 1)
+    return database.negative_ratio_between(
+        start.isoformat(), end.isoformat(), keyword
+    )
+
+
 def _week_over_week(keyword: str) -> tuple[str, float | None]:
     today = date.today()
-    baseline_day = (today - timedelta(days=7)).isoformat()
-
-    today_ratio = database.negative_ratio_on(today.isoformat(), keyword)
-    baseline_ratio = database.negative_ratio_on(baseline_day, keyword)
+    # 近 7 天 vs 上一个 7 天：避免「周一没数据 → 基线不足」的单日噪声
+    today_ratio = _window_ratio(keyword, today)
+    baseline_ratio = _window_ratio(keyword, today - timedelta(days=7))
 
     if today_ratio is None or baseline_ratio is None:
         return "历史基线不足，暂无法计算周同比", None
@@ -37,7 +44,7 @@ def _week_over_week(keyword: str) -> tuple[str, float | None]:
 
 
 def build_context(keyword: str, titles: list[str], log=print) -> MemoryContext:
-    similar = store.query_similar(titles, k=6, days=7, log=log)
+    similar = store.query_similar(titles, k=6, days=7, log=log, keyword=keyword)
     comparison, delta = _week_over_week(keyword)
 
     lines = ["【历史上下文：近 7 天相似资讯】"]

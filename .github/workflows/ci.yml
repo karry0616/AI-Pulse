@@ -18,7 +18,12 @@ jobs:
 
       # 只装测试真正 import 到的依赖，跳过 streamlit / chromadb 等重包
       - name: Install test dependencies
-        run: pip install pandas requests feedparser pytest
+        run: pip install pandas==3.1.0 requests==2.34.2 feedparser==6.0.14 pytest==9.2.0 ruff==0.17.3 "coverage>=7.6"
 
-      - name: Run tests
-        run: python -m pytest -q
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Run tests with coverage
+        run: |
+          coverage run -m pytest -q
+          coverage report -m

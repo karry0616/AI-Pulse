@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import math
-import re
+import os
 import sys
 import time
 from collections import Counter
@@ -17,8 +17,11 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import database
+from textutils import bigrams, normalize
 
-CHROMA_DIR = Path(__file__).resolve().parent.parent / "chroma_db"
+_ROOT = Path(__file__).resolve().parent.parent
+# 容器部署时用 PULSE_CHROMA_DIR 指向共享卷；本地默认仍在项目根目录
+CHROMA_DIR = Path(os.getenv("PULSE_CHROMA_DIR") or (_ROOT / "chroma_db"))
 COLLECTION_NAME = "intel_history"
 EMBED_DIM = 512
 RETRY_COOLDOWN = 300  # 向量库失败后的冷却秒数，到期自动重试
@@ -72,7 +75,7 @@ def _doc_text(item: dict) -> str:
 
 def _embed_text(text: str) -> list[float]:
     """字符 1/2-gram 哈希嵌入：离线可用，中英文都适用。"""
-    cleaned = re.sub(r"[\s\W_]+", "", str(text).lower())
+    cleaned = normalize(text)
     grams: Counter[str] = Counter(cleaned)
     for i in range(len(cleaned) - 1):
         grams[cleaned[i : i + 2]] += 1
@@ -119,6 +122,24 @@ def count() -> int:
         return 0
 
 
+def available() -> bool:
+    """是否可用于本轮检索：已初始化，或不在失败冷却期。"""
+    return _collection is not None or not (
+        _disabled_until and time.time() < _disabled_until
+    )
+
+
+def status() -> dict:
+    """只读健康状态，不触发 Chroma 初始化（供 /api/health 使用）。"""
+    remaining = max(int(_disabled_until - time.time()), 0)
+    return {
+        "initialized": _collection is not None,
+        "available": available(),
+        "cooldown_remaining": remaining,
+        "dir": str(CHROMA_DIR),
+    }
+
+
 def index_items(items: list[dict], log=print) -> int:
     """把资讯 upsert 进向量库，返回写入条数。"""
     collection = _get_collection(log)
@@ -149,15 +170,18 @@ def index_items(items: list[dict], log=print) -> int:
 
 
 def _bigrams(text: str) -> set[str]:
-    cleaned = re.sub(r"\s+", "", str(text).lower())
-    if len(cleaned) < 2:
-        return {cleaned} if cleaned else set()
-    return {cleaned[i : i + 2] for i in range(len(cleaned) - 1)}
+    return bigrams(text)
 
 
-def _fallback_query(texts: list[str], k: int, days: int, log=print) -> list[dict]:
+def _fallback_query(
+    texts: list[str],
+    k: int,
+    days: int,
+    log=print,
+    keyword: str | None = None,
+) -> list[dict]:
     """无向量能力时，用字符二元组重合度做替代检索。"""
-    df = database.fetch_recent(days=days)
+    df = database.fetch_recent(days=days, keyword=keyword)
     if df.empty:
         return []
 
@@ -200,53 +224,61 @@ def query_similar(
     k: int = 6,
     days: int = 7,
     log=print,
+    keyword: str | None = None,
 ) -> list[dict]:
-    """召回近 N 天相似资讯；向量不可用时自动降级。"""
+    """召回近 N 天相似资讯；向量不可用时自动降级。
+
+    多个查询文本（收藏标题 + 今日标题）会合并成一次多查询召回，
+    结果按标题去重并保留最高相似度，避免只取第一条查询导致召回浪费。
+    """
     if not texts:
         return []
 
     collection = _get_collection(log)
     if collection is None:
-        return _fallback_query(texts, k, days, log)
+        return _fallback_query(texts, k, days, log, keyword)
 
     try:
         total = int(collection.count())
         if total == 0:
-            return _fallback_query(texts, k, days, log)
+            return _fallback_query(texts, k, days, log, keyword)
 
         cutoff = (date.today() - timedelta(days=days)).toordinal()
+        where: dict = {"day_index": {"$gte": cutoff}}
+        if keyword:
+            where = {"$and": [{"day_index": {"$gte": cutoff}}, {"keyword": keyword}]}
         payload = collection.query(
             query_embeddings=_embed_many(texts[:5]),
             n_results=min(k, total),
-            where={"day_index": {"$gte": cutoff}},
+            where=where,
         )
     except Exception as exc:
         _disable(f"{type(exc).__name__}: {exc}", log)
-        return _fallback_query(texts, k, days, log)
+        return _fallback_query(texts, k, days, log, keyword)
 
-    documents = (payload.get("documents") or [[]])[0]
-    metadatas = (payload.get("metadatas") or [[]])[0]
-    distances = (payload.get("distances") or [[]])[0]
+    documents = payload.get("documents") or []
+    metadatas = payload.get("metadatas") or []
+    distances = payload.get("distances") or []
 
-    results: list[dict] = []
-    seen: set[str] = set()
-    for doc, meta, distance in zip(documents, metadatas, distances):
-        meta = meta or {}
-        title = str(meta.get("title") or doc[:40])
-        if title in seen:
-            continue
-        seen.add(title)
-        results.append(
-            {
+    best: dict[str, dict] = {}
+    for docs, metas, dists in zip(documents, metadatas, distances):
+        for doc, meta, distance in zip(docs or [], metas or [], dists or []):
+            meta = meta or {}
+            title = str(meta.get("title") or str(doc or "")[:40])
+            similarity = round(1 - float(distance), 3)
+            current = best.get(title)
+            if current and current["similarity"] >= similarity:
+                continue
+            best[title] = {
                 "title": title,
                 "date": meta.get("date", ""),
                 "source": meta.get("source", ""),
                 "sentiment": meta.get("sentiment", "neutral"),
-                "similarity": round(1 - float(distance), 3),
+                "similarity": similarity,
                 "mode": "vector",
             }
-        )
 
+    results = sorted(best.values(), key=lambda item: item["similarity"], reverse=True)[:k]
     if results:
         log(f"[RAG] 向量召回 {len(results)} 条历史资讯")
     return results

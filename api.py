@@ -13,6 +13,8 @@ r"""HTTP API：把 pipeline / database 的核心能力暴露给外部系统。
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -25,11 +27,14 @@ import config
 import database
 import logging_setup
 import pipeline
+from rag import store as rag_store
 from sources import DATA_SOURCES, KEYWORDS
 
 HOST = "127.0.0.1"
 PORT = 8502
 MAX_BODY_BYTES = 64 * 1024
+# 健康检查与飞书回调不要求 API Token（后者靠飞书签名校验）
+PUBLIC_PATHS = {"/api/health", "/api/callback/feishu"}
 
 
 def _log(message: str) -> None:
@@ -42,6 +47,23 @@ _log.writes_file = True
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _api_token() -> str:
+    config.load_env()
+    return os.getenv("API_TOKEN", "").strip()
+
+
+def _int_param(qs: dict, name: str, default: int, maximum: int, minimum: int = 1) -> int:
+    """查询参数取整数并夹紧范围；非法值抛 ValueError（由路由转成 400）。"""
+    raw = (qs.get(name) or [str(default)])[0]
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"参数 {name} 必须是整数，实际为 {raw!r}") from None
+    if value < minimum:
+        raise ValueError(f"参数 {name} 不能小于 {minimum}")
+    return min(value, maximum)
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -60,9 +82,12 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Token, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -73,13 +98,45 @@ class APIHandler(BaseHTTPRequestHandler):
         self._send(code, {"ok": False, "error": message})
 
     # ------------------------------------------------------------------
+    # 鉴权与 CORS
+    # ------------------------------------------------------------------
+    def _cors_origin(self) -> str:
+        """默认不发 CORS 头；只有显式配置 CORS_ALLOW_ORIGIN 才允许跨域。"""
+        config.load_env()
+        allowed = os.getenv("CORS_ALLOW_ORIGIN", "").strip()
+        if not allowed:
+            return ""
+        if allowed == "*":
+            return "*"
+        origin = (self.headers.get("Origin") or "").strip()
+        candidates = {item.strip() for item in allowed.split(",") if item.strip()}
+        return origin if origin in candidates else ""
+
+    def _authorized(self, path: str) -> bool:
+        token = _api_token()
+        if not token or path in PUBLIC_PATHS:
+            return True
+
+        provided = (self.headers.get("X-API-Token") or "").strip()
+        if not provided:
+            auth = (self.headers.get("Authorization") or "").strip()
+            if auth.lower().startswith("bearer "):
+                provided = auth[7:].strip()
+        return bool(provided) and hmac.compare_digest(provided, token)
+
+    # ------------------------------------------------------------------
     # CORS 预检
     # ------------------------------------------------------------------
     def do_OPTIONS(self) -> None:
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header(
+                "Access-Control-Allow-Headers", "Content-Type, X-API-Token, Authorization"
+            )
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Vary", "Origin")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -91,9 +148,13 @@ class APIHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         qs = parse_qs(parsed.query)
 
+        if not self._authorized(path):
+            self._err(401, "缺少或无效的 API Token（请求头 X-API-Token / Authorization: Bearer）")
+            return
+
         try:
             routes = {
-                "/api/health": lambda: self._ok(time=_now(), service="ai-pulse"),
+                "/api/health": self._handle_health,
                 "/api/keywords": lambda: self._ok(keywords=KEYWORDS, sources=DATA_SOURCES),
                 "/api/status": self._handle_status,
                 "/api/alerts": lambda: self._handle_alerts(qs),
@@ -108,6 +169,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._err(404, f"未知路径：{path}")
                 return
             handler()
+        except ValueError as exc:
+            self._err(400, str(exc))
         except Exception as exc:  # 单请求异常不影响服务
             _log(f"[WARN] GET {path} 失败：{type(exc).__name__}: {exc}")
             self._err(500, f"{type(exc).__name__}: {exc}")
@@ -115,6 +178,11 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path.rstrip("/") or "/"
 
+        if not self._authorized(path):
+            self._err(401, "缺少或无效的 API Token（请求头 X-API-Token / Authorization: Bearer）")
+            return
+
+        self._raw_body = b""
         try:
             body = self._read_json()
         except ValueError as exc:
@@ -132,6 +200,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self._err(404, f"未知路径：{path}")
                 return
             handler()
+        except ValueError as exc:
+            self._err(400, str(exc))
         except Exception as exc:
             _log(f"[WARN] POST {path} 失败：{type(exc).__name__}: {exc}")
             self._err(500, f"{type(exc).__name__}: {exc}")
@@ -143,6 +213,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if length > MAX_BODY_BYTES:
             raise ValueError(f"请求体过大（{length} 字节）")
         raw = self.rfile.read(length)
+        self._raw_body = raw
         if not raw.strip():
             return {}
         data = json.loads(raw.decode("utf-8"))
@@ -151,6 +222,20 @@ class APIHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
     # GET handlers
     # ------------------------------------------------------------------
+    def _handle_health(self) -> None:
+        """就绪检查：数据库可用才算健康；向量库与运行锁只作状态上报。"""
+        db = database.health()
+        payload = {
+            "time": _now(),
+            "db": db,
+            "rag": rag_store.status(),
+            "lock": pipeline.lock_status(),
+        }
+        if not db.get("ok"):
+            self._send(503, {"ok": False, "error": "数据库不可用", **payload})
+            return
+        self._ok(**payload)
+
     def _handle_status(self) -> None:
         self._ok(
             lock=pipeline.lock_status(),
@@ -161,41 +246,29 @@ class APIHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_alerts(self, qs: dict) -> None:
-        conditions = ["1=1"]
-        params: list = []
-        if qs.get("keyword"):
-            conditions.append("keyword = ?")
-            params.append(qs["keyword"][0])
-        if qs.get("status"):
-            conditions.append("status = ?")
-            params.append(qs["status"][0])
-        limit = min(int(qs.get("limit", ["20"])[0]), 200)
-
-        sql = (
-            "SELECT * FROM alerts WHERE "
-            + " AND ".join(conditions)
-            + " ORDER BY id DESC LIMIT ?"
+        keyword = qs.get("keyword", [None])[0]
+        status = qs.get("status", [None])[0]
+        limit = _int_param(qs, "limit", 20, 200)
+        self._ok(
+            alerts=database.recent_alerts(limit=limit, keyword=keyword, status=status)
         )
-        with database._connect() as conn:
-            rows = conn.execute(sql, [*params, limit]).fetchall()
-        self._ok(alerts=[dict(row) for row in rows])
 
     def _handle_threads(self, qs: dict) -> None:
         keyword = qs.get("keyword", [None])[0]
-        days = int(qs.get("days", ["7"])[0])
-        limit = min(int(qs.get("limit", ["20"])[0]), 100)
+        days = _int_param(qs, "days", 7, 90)
+        limit = _int_param(qs, "limit", 20, 100)
         self._ok(threads=database.top_threads(keyword=keyword, days=days, limit=limit))
 
     def _handle_intel(self, qs: dict) -> None:
         keyword = qs.get("keyword", [None])[0]
-        days = int(qs.get("days", ["7"])[0])
-        limit = min(int(qs.get("limit", ["100"])[0]), 500)
+        days = _int_param(qs, "days", 7, 90)
+        limit = _int_param(qs, "limit", 100, 500)
         df = database.fetch_recent(days=days, keyword=keyword)
         items = df.head(limit).to_dict("records") if not df.empty else []
         self._ok(items=items, total=int(len(df)))
 
     def _handle_runs(self, qs: dict) -> None:
-        limit = min(int(qs.get("limit", ["10"])[0]), 100)
+        limit = _int_param(qs, "limit", 10, 100)
         self._ok(runs=database.recent_runs(limit=limit))
 
     def _handle_cost(self) -> None:
@@ -257,6 +330,12 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # 异步触发前先看运行锁：已有任务在跑就立刻返回 409，避免 202 后静默失败
+        lock = pipeline.lock_status()
+        if lock and lock.get("alive"):
+            self._send(409, {"ok": False, "error": "已有任务正在运行", "lock": lock})
+            return
+
         def background() -> None:
             try:
                 pipeline.run(keyword, sources, trigger=trigger, log=_log)
@@ -276,14 +355,19 @@ class APIHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_review(self, body: dict) -> None:
-        alert_id = int(body.get("alert_id") or 0)
+        raw_id = body.get("alert_id")
+        try:
+            alert_id = int(raw_id)
+        except (TypeError, ValueError):
+            self._err(400, "缺少有效的 alert_id（必须是整数）")
+            return
+        if alert_id <= 0:
+            self._err(400, "缺少有效的 alert_id（必须是正整数）")
+            return
+
         action = str(body.get("action") or "approve").lower()
         reviewer = str(body.get("reviewed_by") or "api")
         note = str(body.get("review_note") or "")
-
-        if not alert_id:
-            self._err(400, "缺少 alert_id")
-            return
         if action not in ("approve", "reject"):
             self._err(400, f"不支持的 action：{action}，可选 approve / reject")
             return
@@ -310,6 +394,37 @@ class APIHandler(BaseHTTPRequestHandler):
         status = 200 if outcome.get("ok") else 409
         self._send(status, {"ok": bool(outcome.get("ok")), **outcome})
 
+    def _verify_feishu(self, body: dict) -> bool:
+        """校验飞书回调签名与 verification token（未配置则跳过，便于本地联调）。
+
+        签名算法：sha256(timestamp + nonce + encrypt_key + 原始请求体)。
+        时间戳必须来自原始 header，因此需要 _read_json 保存的 _raw_body。
+        """
+        config.load_env()
+        token = os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip()
+        encrypt_key = os.getenv("FEISHU_ENCRYPT_KEY", "").strip()
+
+        if token:
+            header = body.get("header") if isinstance(body.get("header"), dict) else {}
+            provided = str(body.get("token") or header.get("token") or "")
+            if provided and not hmac.compare_digest(provided, token):
+                return False
+
+        if encrypt_key:
+            timestamp = (self.headers.get("X-Lark-Request-Timestamp") or "").strip()
+            nonce = (self.headers.get("X-Lark-Request-Nonce") or "").strip()
+            signature = (self.headers.get("X-Lark-Signature") or "").strip()
+            if not timestamp or not nonce or not signature:
+                return False
+            content = (timestamp + nonce + encrypt_key).encode("utf-8") + (
+                self._raw_body or b""
+            )
+            expected = hashlib.sha256(content).hexdigest()
+            if not hmac.compare_digest(expected, signature):
+                return False
+
+        return True
+
     def _handle_feishu_callback(self, body: dict) -> None:
         """飞书卡片按钮回调：点「通过」直接推送，点「驳回」留审计记录。
 
@@ -317,6 +432,11 @@ class APIHandler(BaseHTTPRequestHandler):
         - 老版：{"action": {"value": {...}}}
         - 卡片 2.0：{"event": {"action": {"value": {...}}, "operator": {"open_id": ...}}}
         """
+        if not self._verify_feishu(body):
+            _log("[FEISHU] 回调签名校验失败，已拒绝")
+            self._err(403, "飞书回调签名校验失败")
+            return
+
         # 首次配置回调地址时飞书会发 verification 请求
         if body.get("type") == "url_verification":
             self._ok(challenge=body.get("challenge", ""))

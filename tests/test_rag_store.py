@@ -3,7 +3,9 @@
 import math
 import sys
 import types
+from datetime import date
 
+import database
 from rag import store
 
 
@@ -23,6 +25,39 @@ def test_doc_id_depends_on_date_and_title():
     c = store._doc_id({"date": "2026-01-02", "title": "新闻A"})
     assert a == b
     assert a != c
+
+
+def test_fallback_query_filters_by_keyword(tmp_path, monkeypatch):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "rag.db")
+    database.init_db()
+    day = date.today().isoformat()
+    database.save_items(
+        [
+            {
+                "date": day,
+                "keyword": "AI Agent",
+                "title": "OpenAI 发布新模型",
+                "summary": "通用能力升级",
+                "sentiment": "neutral",
+                "source": "test",
+                "url": "",
+            },
+            {
+                "date": day,
+                "keyword": "RAG",
+                "title": "OpenAI 发布新模型 RAG 专场",
+                "summary": "检索增强专场",
+                "sentiment": "neutral",
+                "source": "test",
+                "url": "",
+            },
+        ]
+    )
+
+    results = store._fallback_query(
+        ["OpenAI 发布新模型 RAG 专场"], k=5, days=7, log=lambda m: None, keyword="AI Agent"
+    )
+    assert [item["title"] for item in results] == ["OpenAI 发布新模型"]
 
 
 def test_collection_recovers_after_cooldown(monkeypatch):

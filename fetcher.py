@@ -14,8 +14,7 @@ import html
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime
 from urllib.parse import quote
 
@@ -23,7 +22,9 @@ import feedparser
 import requests
 
 import database
+from sentiment import NEGATIVE_WORDS, POSITIVE_WORDS, guess_sentiment  # noqa: F401
 from sources import KEYWORD_ALIASES, SEARCH_TERMS, SOURCES
+from textutils import canonical_title, canonical_url
 
 USER_AGENT = "Mozilla/5.0 (compatible; AI-Pulse/0.1; +https://localhost)"
 TIMEOUT = 5
@@ -41,18 +42,6 @@ def clear_cache() -> None:
     _CACHE.clear()
     _FAIL_CACHE.clear()
 
-
-POSITIVE_WORDS = [
-    "launch", "funding", "raises", "breakthrough", "partnership", "record",
-    "surge", "release", "open-source", "wins", "growth", "boost",
-    "发布", "融资", "突破", "增长", "合作", "开源", "上线", "刷新", "领跑",
-]
-
-NEGATIVE_WORDS = [
-    "layoff", "lawsuit", "leak", "breach", "outage", "fine", "ban", "risk",
-    "vulnerability", "scandal", "shutdown", "downturn",
-    "裁员", "泄露", "诉讼", "漏洞", "风险", "处罚", "封禁", "宕机", "争议", "下滑",
-]
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
@@ -86,28 +75,9 @@ def match_keyword(text: str, keyword: str) -> bool:
     return any(alias.lower() in lowered for alias in aliases)
 
 
-def _count_terms(text: str, terms: list[str]) -> int:
-    """英文词按边界匹配（避免 risk-free 命中 risk，但允许复数 s），中文按子串计数。"""
-    total = 0
-    for term in terms:
-        if term.isascii():
-            total += len(re.findall(rf"(?<![a-z-]){re.escape(term)}s?(?![a-z-])", text))
-        else:
-            total += text.count(term)
-    return total
-
-
-def guess_sentiment(text: str) -> str:
-    """轻量规则情感判定，真正的情感聚合后续交给 LLM。"""
-    lowered = text.lower()
-    pos = _count_terms(lowered, POSITIVE_WORDS)
-    neg = _count_terms(lowered, NEGATIVE_WORDS)
-
-    if neg > pos:
-        return "negative"
-    if pos > neg:
-        return "positive"
-    return "neutral"
+def _failed_recently(logical: str, keyword: str) -> bool:
+    failed_at = _FAIL_CACHE.get((logical, keyword))
+    return bool(failed_at and time.time() - failed_at < FAIL_TTL)
 
 
 def fetch_source(
@@ -187,8 +157,7 @@ def _fetch_logical(
     messages: list[str],
 ) -> list[dict]:
     """抓取一个逻辑数据源（含候选源回退），日志先收集、回到主线程再输出。"""
-    failed_at = _FAIL_CACHE.get((logical, keyword))
-    if failed_at and time.time() - failed_at < FAIL_TTL:
+    if _failed_recently(logical, keyword):
         messages.append(f"[CACHE] {logical} 近 {FAIL_TTL}s 内失败过，本轮跳过")
         return []
 
@@ -232,14 +201,18 @@ def fetch_all(
         logical: pool.submit(_fetch_logical, logical, keyword, per_source, messages[logical])
         for logical in sources
     }
-    deadline = time.monotonic() + FETCH_BUDGET
+    # 一次性等到预算结束：所有源共享同一个截止时间，避免按顺序逐个等待
+    # 导致「第一个慢源吃掉预算，后面的源刚提交就被判超时」。
+    done, _ = wait(futures.values(), timeout=FETCH_BUDGET)
     for logical in sources:
-        try:
-            results[logical] = futures[logical].result(timeout=max(deadline - time.monotonic(), 0))
-        except FutureTimeout:
+        future = futures[logical]
+        if future not in done:
             messages[logical] = [f"[WARN] {logical} 超过 {FETCH_BUDGET}s 未返回，本轮跳过"]
             results[logical] = []
             _FAIL_CACHE[(logical, keyword)] = time.time()
+            continue
+        try:
+            results[logical] = future.result()
         except Exception as exc:  # 单源异常不拖垮整轮抓取
             messages[logical] = [f"[WARN] {logical} 抓取异常：{type(exc).__name__}"]
             results[logical] = []
@@ -251,13 +224,20 @@ def fetch_all(
             log(message)
 
     all_items: list[dict] = []
-    seen: set[str] = set()
+    seen_titles: set[str] = set()
+    seen_urls: set[str] = set()
     for logical in sources:
         for item in results.get(logical, []):
-            key = item["title"].lower()
-            if key in seen:
+            title_key = canonical_title(item.get("title"))
+            url_key = canonical_url(item.get("url"))
+            if title_key and title_key in seen_titles:
                 continue
-            seen.add(key)
+            if url_key and url_key in seen_urls:
+                continue
+            if title_key:
+                seen_titles.add(title_key)
+            if url_key:
+                seen_urls.add(url_key)
             all_items.append(item)
 
     return all_items

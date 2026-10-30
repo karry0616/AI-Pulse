@@ -40,6 +40,47 @@ AMBER = "#FBBF24"
 RED = "#F87171"
 MUTED = "#8B93A7"
 PLOTLY_FONT = "Inter, 'Segoe UI', 'Microsoft YaHei', sans-serif"
+ALERT_STATUS = {
+    "pending": "⏳ 待审核",
+    "sending": "🚀 推送中",
+    "sent": "✅ 已推送",
+    "failed": "⚠️ 推送失败",
+    "rejected": "🚫 已驳回",
+    "expired": "⌛ 已过期",
+}
+
+
+# ---------------------------------------------------------------------------
+# 查询缓存：页面每次 rerun 都会重查 SQLite，60 秒内复用结果降低 I/O
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_snapshot(keyword: str, day: str) -> dict:
+    return database.latest_snapshot(keyword)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_daily_stats(days: int, keyword: str) -> pd.DataFrame:
+    return database.daily_stats(days=days, keyword=keyword)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_history(limit: int) -> list[dict]:
+    return database.history_cards(limit=limit)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_recent_count(days: int) -> int:
+    return len(database.fetch_recent(days=days))
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_recent_alerts(limit: int, keyword: str) -> list[dict]:
+    return database.recent_alerts(limit=limit, keyword=keyword)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_latest_alert(run_id: str) -> dict | None:
+    return database.latest_alert(run_id)
 
 
 def section(title: str, caption: str) -> None:
@@ -124,6 +165,7 @@ def run_pipeline(keyword: str, sources: list[str]) -> tuple[str, str]:
                 state="complete",
                 expanded=False,
             )
+            st.cache_data.clear()  # 新情报入库后让 KPI / 图表 / 审批列表立即刷新
         except pipeline.RunLockedError as exc:
             add_log(f"[WARN] {exc}")
             status.update(label="已有任务正在运行", state="error", expanded=True)
@@ -165,7 +207,7 @@ with st.sidebar:
     )
 
     st.markdown('<div class="side-label">历史记录</div>', unsafe_allow_html=True)
-    history = database.history_cards(limit=5)
+    history = cached_history(limit=5)
     if history:
         for item in history:
             score = item["score"]
@@ -183,7 +225,7 @@ with st.sidebar:
                 """,
                 unsafe_allow_html=True,
             )
-        st.caption(f"共 {len(database.fetch_recent(days=30))} 条存档 · SQLite 实时数据")
+        st.caption(f"共 {cached_recent_count(days=30)} 条存档 · SQLite 实时数据")
     else:
         st.caption("暂无历史记录，点击「立即更新情报」开始采集")
 
@@ -265,8 +307,8 @@ if st.session_state.analysis_keyword != keyword:
     st.session_state.analysis_keyword = keyword if persisted else None
 
 analysis = st.session_state.analysis if st.session_state.analysis_keyword == keyword else None
-snapshot = database.latest_snapshot(keyword)
-trend = database.daily_stats(days=2, keyword=keyword)
+snapshot = cached_snapshot(keyword, date.today().isoformat())
+trend = cached_daily_stats(days=2, keyword=keyword)
 today_total = snapshot["total"]
 prev_total = int(trend["total"].iloc[0]) if len(trend) >= 2 else 0
 
@@ -314,7 +356,7 @@ with k3:
 # ---------------------------------------------------------------------------
 section("趋势与情绪可视化", f"{keyword} · 近 7 天 / 近 3 天")
 
-stats7 = database.daily_stats(days=7, keyword=keyword)
+stats7 = cached_daily_stats(days=7, keyword=keyword)
 
 heat_df = (
     stats7[["date", "total"]]
@@ -393,7 +435,7 @@ alert_row = None
 if analysis:
     alert_run_id = analysis.get("_run_id") or st.session_state.last_run_id
     if alert_run_id:
-        alert_row = database.latest_alert(alert_run_id)
+        alert_row = cached_latest_alert(alert_run_id)
 
 if analysis:
     alert_level = "HIGH" if alert_count >= 2 else "MEDIUM" if alert_count == 1 else "LOW"
@@ -461,6 +503,7 @@ with alert_col:
                     alert_row["id"], log=add_log, reviewed_by=reviewer
                 )
             st.session_state.webhook_ok = push_result.ok
+            st.cache_data.clear()
             st.rerun()
         if st.button(
             "驳回本条预警",
@@ -471,6 +514,7 @@ with alert_col:
                 alert_row["id"], log=add_log, reviewed_by=reviewer
             )
             st.toast(outcome["reason"], icon="✅" if outcome["ok"] else "⚠️")
+            st.cache_data.clear()
             st.rerun()
     elif analysis and not alert_row and alert_count == 0:
         if st.button(
@@ -487,14 +531,30 @@ with alert_col:
                 ),
                 level="MEDIUM",
                 heat_score=analysis.get("heat_score"),
+                is_demo=True,
             )
             st.session_state.pending_alert_id = demo_id
+            st.cache_data.clear()
             st.rerun()
         st.caption("插入一条标注 [DEMO] 的样例预警，用于演示人工审核与推送流程")
 
 if analysis:
     with st.expander("Agent 执行轨迹 · Collector → Analyst → Critic", expanded=False):
         trace.render_trace(analysis)
+
+approval_history = cached_recent_alerts(8, keyword)
+if approval_history:
+    with st.expander(f"审批历史 · 「{keyword}」最近 {len(approval_history)} 条", expanded=False):
+        for row in approval_history:
+            demo_flag = " · DEMO" if row.get("is_demo") else ""
+            status_text = ALERT_STATUS.get(row["status"], row["status"])
+            created = str(row.get("created_at") or "")[:16]
+            reviewer_name = row.get("reviewed_by") or "未审批"
+            st.markdown(
+                f"**#{row['id']}** {status_text} · {row.get('level') or '-'}{demo_flag} · "
+                f"{created} · 审批人 {reviewer_name}  \n"
+                f"{str(row.get('warning_text') or '')[:60]}"
+            )
 
 # ---------------------------------------------------------------------------
 # 10. 底部：数据流转面板（终端黑框）

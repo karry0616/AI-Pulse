@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from textutils import normalize
+
 from .analyst import FALLBACK_MATURITY
 from .state import AgentState
 
@@ -24,7 +26,7 @@ BULLET_RE = re.compile(r"^\s*-\s*\*\*(.+?)\*\*")
 
 def _normalize(text: str) -> str:
     """去掉空白与标点，统一大小写，便于标题核对。"""
-    return re.sub(r"[^\w]+", "", str(text or "")).lower()
+    return normalize(text)
 
 
 def _matches_input_title(head: str, titles: list[str]) -> bool:
@@ -102,8 +104,8 @@ def check_contract(draft: dict | None, state: AgentState) -> list[str]:
         issues.append("maturity 必须是表头为 | 方向 | 成熟度 | 阶段判断 | 的 3-5 行表格")
 
     warning = str(draft.get("warning_text") or "").strip()
-    if not 20 <= len(warning) <= 400:
-        issues.append(f"warning_text 长度需在 20-400 字之间，实际 {len(warning)} 字")
+    if not 30 <= len(warning) <= 200:
+        issues.append(f"warning_text 长度需在 30-200 字之间，实际 {len(warning)} 字")
 
     comparison = str(draft.get("comparison") or "").strip()
     if not comparison:
