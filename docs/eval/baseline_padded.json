@@ -1,0 +1,221 @@
+{
+  "generated_at": "2026-10-30T22:40:59",
+  "keyword": "AI Agent",
+  "corpus_size": 9,
+  "batch_size": 1,
+  "summary": {
+    "P": {
+      "samples": 9,
+      "contract_pass_rate": 100.0,
+      "avg_verified_ratio": 1.0,
+      "hallucination_rate": 0.0,
+      "avg_alert_error": 0.33,
+      "avg_latency_ms": 6023,
+      "total_tokens": 17398,
+      "avg_attempts": 1.0,
+      "degraded_rate": 0.0
+    }
+  },
+  "samples": {
+    "P": [
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 6122,
+        "total_tokens": 2012,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 1,
+        "items": 1,
+        "titles": [
+          "AI+垂类Agent：任务跑得久、工具用得熟，撑不起Agent公司长期竞争力｜贝联珠贯创始人兼CEO 毕玄分享"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 5965,
+        "total_tokens": 2010,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 2,
+        "items": 1,
+        "titles": [
+          "Chainguard 推出面向 AI 编码智能体的安全工作区与安全校验能力"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 6645,
+        "total_tokens": 1996,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 3,
+        "items": 1,
+        "titles": [
+          "谷歌推出 EnvHarness，支持自进化智能体动态环境学习"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 5990,
+        "total_tokens": 1960,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 4,
+        "items": 1,
+        "titles": [
+          "DoorDash said it’s only received ‘several hundred’ orders from AI agents"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 5840,
+        "total_tokens": 1886,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 5,
+        "items": 1,
+        "titles": [
+          "Show HN: Arsaze – Cursor for video editing (Tab-complete and agent edits)"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 6240,
+        "total_tokens": 1886,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 6,
+        "items": 1,
+        "titles": [
+          "Show HN: HiveOS – Multi-agent enterprise OS with PII pills and 3-model consensus"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 6063,
+        "total_tokens": 1882,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 7,
+        "items": 1,
+        "titles": [
+          "Show HN: Send21 – Crypto pay links an AI agent can create but can't spend"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 5826,
+        "total_tokens": 1863,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 8,
+        "items": 1,
+        "titles": [
+          "Last night an AI agent performed surgery on a mouse"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 5515,
+        "total_tokens": 1903,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "padded_items": 5,
+        "batch": 9,
+        "items": 1,
+        "titles": [
+          "An attack against an LLM agent is either detected or proven"
+        ]
+      }
+    ]
+  }
+}

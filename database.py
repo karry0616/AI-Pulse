@@ -57,7 +57,12 @@ CREATE TABLE IF NOT EXISTS run_logs (
     started_at  TEXT,
     finished_at TEXT,
     duration_ms INTEGER DEFAULT 0,
-    error       TEXT
+    error       TEXT,
+    sources_ok    INTEGER DEFAULT 0,
+    sources_total INTEGER DEFAULT 0,
+    rejections    INTEGER DEFAULT 0,
+    degraded      INTEGER DEFAULT 0,
+    fetch_ms      INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS llm_calls (
@@ -218,6 +223,23 @@ def _migrate_v4_demo_column(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE alerts ADD COLUMN is_demo INTEGER DEFAULT 0")
 
 
+RUN_METRIC_COLUMNS = (
+    ("sources_ok", "INTEGER DEFAULT 0"),
+    ("sources_total", "INTEGER DEFAULT 0"),
+    ("rejections", "INTEGER DEFAULT 0"),
+    ("degraded", "INTEGER DEFAULT 0"),
+    ("fetch_ms", "INTEGER DEFAULT 0"),
+)
+
+
+def _migrate_v5_run_metrics(conn: sqlite3.Connection) -> None:
+    """v5：run_logs 增加运行指标列，让「抓取成功率 / 打回次数 / 降级率」可被查询。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(run_logs)").fetchall()}
+    for name, ddl in RUN_METRIC_COLUMNS:
+        if name not in columns:
+            conn.execute(f"ALTER TABLE run_logs ADD COLUMN {name} {ddl}")
+
+
 def init_db() -> None:
     """建表 + 迁移 + 索引，可重复调用。"""
     with _connect() as conn:
@@ -238,6 +260,10 @@ def init_db() -> None:
             # v4：演示预警标记，避免污染真实误报率统计
             _migrate_v4_demo_column(conn)
             conn.execute("PRAGMA user_version = 4")
+        if version < 5:
+            # v5：运行指标列（抓取成功率 / 打回次数 / 降级标记 / 抓取耗时）
+            _migrate_v5_run_metrics(conn)
+            conn.execute("PRAGMA user_version = 5")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_date ON daily_intel(date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_keyword ON daily_intel(keyword)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_intel_title ON daily_intel(title)")
@@ -486,16 +512,29 @@ def finish_run(
     mode: str = "",
     duration_ms: int = 0,
     error: str = "",
+    sources_ok: int = 0,
+    sources_total: int = 0,
+    rejections: int = 0,
+    degraded: int = 0,
+    fetch_ms: int = 0,
 ) -> None:
     with _connect() as conn:
         conn.execute(
             """
             UPDATE run_logs
                SET status = ?, items = ?, inserted = ?, mode = ?,
-                   duration_ms = ?, error = ?, finished_at = ?
+                   duration_ms = ?, error = ?, finished_at = ?,
+                   sources_ok = ?, sources_total = ?, rejections = ?,
+                   degraded = ?, fetch_ms = ?
              WHERE run_id = ?
             """,
-            (status, items, inserted, mode, duration_ms, error, _now(), run_id),
+            (
+                status, items, inserted, mode,
+                duration_ms, error, _now(),
+                int(sources_ok), int(sources_total), int(rejections),
+                int(degraded), int(fetch_ms),
+                run_id,
+            ),
         )
 
 

@@ -184,13 +184,19 @@ def fetch_all(
     keyword: str = "AI Agent",
     per_source: int = 8,
     log=print,
+    stats: dict | None = None,
 ) -> list[dict]:
     """并发抓取所有数据源，按传入顺序跨源去重后返回。
 
     并发把总耗时从「各源串行累加」压到「最慢单源耗时」，
     日志仍按数据源顺序输出，避免多线程写 Streamlit 会话状态。
+
+    ``stats`` 传入字典时会被写入 ``sources_total`` / ``sources_ok``，
+    供运行指标统计单轮抓取成功率（抓取成功但 0 条命中仍记为成功）。
     """
     if not sources:
+        if stats is not None:
+            stats.update({"sources_total": 0, "sources_ok": 0})
         return []
 
     results: dict[str, list[dict]] = {}
@@ -222,6 +228,10 @@ def fetch_all(
     for logical in sources:
         for message in messages.get(logical, []):
             log(message)
+
+    if stats is not None:
+        failed = sum(1 for logical in sources if _failed_recently(logical, keyword))
+        stats.update({"sources_total": len(sources), "sources_ok": len(sources) - failed})
 
     all_items: list[dict] = []
     seen_titles: set[str] = set()

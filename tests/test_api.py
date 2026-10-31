@@ -332,6 +332,24 @@ def test_health_reports_component_status(base_url):
     assert "rag" in body and "lock" in body
 
 
+def test_health_returns_503_when_database_unavailable(base_url, monkeypatch, tmp_path):
+    """数据库不可写时服务仍存活，健康检查必须给出 503 而不是进程退出（P0-3 回归）。"""
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "missing-dir" / "pulse.db")
+
+    status, body = call(base_url, "/api/health")
+
+    assert status == 503
+    assert body["ok"] is False
+    assert body["db"]["ok"] is False
+    assert body["db"]["error"]
+
+
+def test_bootstrap_db_returns_reason_instead_of_raising(monkeypatch, tmp_path):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "missing-dir" / "pulse.db")
+    reason = api.bootstrap_db()
+    assert reason and "OperationalError" in reason
+
+
 def test_async_run_returns_409_when_lock_is_alive(base_url, monkeypatch):
     monkeypatch.setattr(pipeline, "cooldown_remaining", lambda *a, **k: 0)
     monkeypatch.setattr(pipeline, "lock_status", lambda: {"alive": True, "pid": 1234})

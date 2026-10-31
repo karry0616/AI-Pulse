@@ -4,6 +4,16 @@
 
 不是静态 Mock：新闻来自真实 RSS，分析由 DeepSeek 真实调用生成，每次调用的 token 与耗时都落库可查。**当前版本已完成 P0–P3 全部功能点，并完成 2026-10-30 的 21 项可靠性 / 安全提升；HTTP API 支持 Token 鉴权与飞书签名校验，UI 仍默认只监听本机。**
 
+## 文档导航
+
+| 文档 | 适合谁 | 内容 |
+| --- | --- | --- |
+| [docs/AI_PULSE_技术文档.md](docs/AI_PULSE_技术文档.md) | 面试官、接手开发者 | **唯一技术文档**：架构、数据模型、Agent 契约、API、安全、指标、方案对比、验证报告、修复记录、测试与部署 |
+| [docs/AI_PULSE_小白版.md](docs/AI_PULSE_小白版.md) | 非技术读者 | 用编辑部比喻讲清它做什么、凭什么可信、边界在哪 |
+| README（本文） | 所有人 | 项目速览、快速启动、常用命令 |
+
+> 原 `docs/ARCHITECTURE.md` 与 `docs/VERIFICATION.md` 已合并进技术文档，不再单独维护。
+
 ## 目录
 
 - [它解决什么问题](#它解决什么问题)
@@ -44,7 +54,7 @@
 ```mermaid
 flowchart LR
     A["RSS 源<br/>36Kr · 机器之心/量子位 · TechCrunch · HackerNews<br/>arXiv · InfoQ · Solidot"] --> B["fetcher<br/>6 线程并发 · 清洗 · 关键词过滤"]
-    B --> C[("SQLite<br/>user_version=4")]
+    B --> C[("SQLite<br/>user_version=5")]
     C --> D["Chroma 向量记忆<br/>近 7 天 · 降级为关键词检索"]
     C --> E
     B --> E["Collector<br/>抽取候选事件"]
@@ -82,15 +92,16 @@ flowchart LR
 5. **清洗与筛选**：去 HTML 标签、压缩空白、按别名表匹配关键词，同标题多源只留一条，摘要截断到 160 字。
 6. **增量判断**：`filter_unseen()` 用 `(date, title, keyword)` 识别真正的新条目；本次无新增时回退最近 1 天存档继续分析，避免"空跑"。
 7. **入库**：`save_items()` 写 `daily_intel`，同日期同标题同关键词幂等。
-8. **向量记忆**：`rag_store.index_items()` 把本次资讯幂等 upsert 进 Chroma；`build_context()` 召回近 7 天相似资讯并计算周同比。
-9. **多 Agent 分析**：`agents.graph.run()` 依次执行 Collector / Analyst / Critic，Critic 打回时最多重试 3 次，仍失败则规则降级。
-10. **热度校正**：`pipeline.compute_heat()` 用资讯条数与命中源数算出 800–2000 的热度，覆盖模型自报值（防幻觉）。
-11. **情感回写**：把 Agent 判定的情感写回 `daily_intel`，页面统计口径与报告一致。
-12. **事件线归并**：`events.link_run()` 用标题二元组相似度（阈值 0.5，实体命中 +0.2）把多来源同一事件归到一条线，活跃窗口 7 天。
-13. **分析落库**：`database.save_analysis()` 存完整快照到 `analyses`，刷新页面仍可回放。
-14. **预警暂存**：`negative_alerts > 0` 时写 `alerts`（状态 `pending`），同日同关键词复用同一条记录，不重复生成。
-15. **日报导出**：`reports.save()` 写 `reports/YYYY-MM-DD-{keyword}.md`。
-16. **收尾**：回写 `run_logs`（状态、条数、耗时、模式、错误），释放运行锁。
+8. **补档**：新增不足 5 条时 `pad_analysis_items()` 用最近 3 天存档补齐，保证 `top_news ≥ 3 条可核验` 契约可满足（单条场景实测通过率 88.9% → 100%）。
+9. **向量记忆**：`rag_store.index_items()` 把本次资讯幂等 upsert 进 Chroma；`build_context()` 召回近 7 天相似资讯并计算周同比。
+10. **多 Agent 分析**：`agents.graph.run()` 依次执行 Collector / Analyst / Critic，Critic 打回时最多重试 3 次，仍失败则规则降级；规则模式只校验一次，不做无效重试。
+11. **热度校正**：`pipeline.compute_heat()` 用资讯条数与命中源数算出 800–2000 的热度，覆盖模型自报值（防幻觉）。
+12. **情感回写**：把 Agent 判定的情感写回 `daily_intel`，页面统计口径与报告一致。
+13. **事件线归并**：`events.link_run()` 用标题二元组相似度（阈值 0.5，实体命中 +0.2）把多来源同一事件归到一条线，活跃窗口 7 天。
+14. **分析落库**：`database.save_analysis()` 存完整快照到 `analyses`，刷新页面仍可回放。
+15. **预警暂存**：`negative_alerts > 0` 时写 `alerts`（状态 `pending`），同日同关键词复用同一条记录，不重复生成。
+16. **日报导出**：`reports.save()` 写 `reports/YYYY-MM-DD-{keyword}.md`。
+17. **收尾**：回写 `run_logs`（状态、条数、耗时、模式、错误 + 抓取成功率 / 打回次数 / 降级标记 / 抓取耗时），释放运行锁；`metrics.py` 直接从这里反查成功率、降级率、P50/P95。
 
 推送不在本流程内：人工在 UI 或飞书卡片点"通过"后，才走 `pipeline.push_alert()` 调用 Webhook。
 
@@ -128,6 +139,8 @@ flowchart LR
 8. **Prompt 注入防护**：所有外部文本（今日资讯与历史记忆）都用 `<<<UNTRUSTED_DATA>>>` 边界包裹，并屏蔽"忽略以上指令"类注入句式，模型无法伪造闭合标记。
 9. **可运维**：日志双写 `logs/pulse.log`（2MB × 3 轮转）；`database.py --stats / --archive-days` 做容量统计与冷热归档；Dockerfile + compose + Caddyfile 一键容器化。
 10. **配置收敛**：数据源、关键词、别名只在 `sources.py` 注册一次，UI / 调度器 / API / fetcher 全部从这里取值。
+11. **可观测性不止日志**：`metrics.py` 从 `run_logs` 反查运行成功率、规则降级占比、抓取成功率、P50/P95 耗时与平均打回次数，页面「运行指标」区块与 CLI 共用同一口径。
+12. **有对照组的方案验证**：`eval/baseline.py` 在同一语料、同一弱标签下对比「规则模板 / 单次 LLM / 三 Agent / 补档后三 Agent」，用量化指标说明三 Agent 的收益与代价，而不是自证有效。
 
 ## 功能清单（P0–P3）
 
@@ -138,6 +151,7 @@ flowchart LR
 | P2 | 事件线追踪、HTTP API、审批审计、飞书卡片回调审批、数据归档、Docker 部署 | ✅ |
 | P3 | Prompt 注入防护、密钥掩码治理、日志文件化、按钮冷却、分析结果持久化回放 | ✅ |
 | 2026-10-30 提升 | API Token 鉴权 / 飞书签名 / CORS 白名单、审批原子抢占、共享抓取预算、RAG 多查询与关键词隔离、7 天窗口周同比、热度与正面占比代码校正、Prompt/Critic 契约对齐、情感词表与文本工具收敛、Webhook 重试、页面缓存与审批历史、演示预警标记（`user_version=4`）、依赖锁定、ruff + coverage CI、非 root 容器与北京时间 | ✅ |
+| 复验修复 | P0-1 降级草稿通过契约 / P0-2 库级入口自举 / P0-3 DB 异常降级启动、单条批次补档、运行指标层（`run_logs` v5）、方案对比实验（A/B/C/P）、覆盖率 55% → 77% | ✅ |
 
 ## 数据模型
 
@@ -146,7 +160,7 @@ SQLite（WAL）共 9 张表，`PRAGMA user_version` 记录迁移版本：
 | 表 | 用途 | 关键约束 |
 | --- | --- | --- |
 | `daily_intel` | 抓取到的资讯 | `UNIQUE(date, title, keyword)`（v1 迁移） |
-| `run_logs` | 每次 run 的状态 / 条数 / 耗时 / 错误 | `run_id` 主键；冷却依据最近成功记录 |
+| `run_logs` | 每次 run 的状态 / 条数 / 耗时 / 错误 | `run_id` 主键；v5 增补 `sources_ok / sources_total / rejections / degraded / fetch_ms`，供 `metrics.py` 反查；冷却依据最近成功记录 |
 | `llm_calls` | 每次模型调用的 token / 耗时 / 成败 | 按 `run_id + node` 可审计 |
 | `alerts` | 预警与审批状态 | 六态 `pending/sending/sent/failed/expired/rejected`；v3 加 `reviewed_by` / `review_note`，v4 加 `is_demo` |
 | `event_threads` | 事件线：实体、首末日期、报道数 | `thread_key` 唯一（v2 新增） |
@@ -308,11 +322,13 @@ Get-Content logs\pulse.log -Tail 50                                # 最近日�
 
 ```powershell
 .\.venv\Scripts\pip.exe install -r requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest -q     # 131 passed
+.\.venv\Scripts\python.exe -m pytest -q     # 191 passed
 .\.venv\Scripts\ruff.exe check .            # All checks passed
 ```
 
-覆盖范围：Critic 契约校验、抓取与清洗纯函数、SQLite 持久层与 v1–v4 迁移、审批原子抢占与演示标记、数据源注册表、调度编排、运行锁与冷却、日报渲染、事件线归并、RAG 退化与关键词隔离、API 全端点（鉴权 / 飞书签名 / 参数 400 / 就绪检查）、Prompt 注入防护、日志落盘、归档与分析回放。
+覆盖范围：Critic 契约校验、抓取与清洗纯函数、SQLite 持久层与 v1–v5 迁移、审批原子抢占与演示标记、审批推送分支与 Webhook 重试、数据源注册表、调度编排、运行锁与冷却、日报渲染、事件线归并、RAG 退化与关键词隔离、运行指标、API 全端点（鉴权 / 飞书签名 / 参数 400 / 就绪检查）、Prompt 注入防护、日志落盘、归档与分析回放、Streamlit 页面级 `AppTest` 冒烟（含跑一次 + DEMO 审批流）。
+
+覆盖率：**TOTAL 77%**（`coverage run --source=. -m pytest -q`）；UI 层 `app.py` 86%、`ui/trace.py` 与 `ui/charts.py` 100%。
 
 CI：`.github/workflows/ci.yml`（ruff + coverage + pytest）。
 
@@ -373,6 +389,8 @@ sentiment.py          情感词表与规则打分（fetcher / analyst 共用）
 sources.py            数据源 / 关键词 / 检索词 / 别名唯一注册表
 reports.py            Markdown 日报导出
 database.py           SQLite 九张表、迁移、去重、分析快照、归档、容量统计
+metrics.py            运行指标层：成功率 / 降级率 / 抓取成功率 / P50·P95
+eval/baseline.py      方案对比实验（规则模板 / 单次 LLM / 三 Agent / 补档后）
 api.py                HTTP API（标准库） + 飞书卡片回调审批
 logging_setup.py      统一日志：控制台 + logs/pulse.log 轮转
 llm/client.py         DeepSeek JSON Mode 封装 + token/耗时计量 + 重试退避
@@ -393,8 +411,9 @@ deploy/Caddyfile      域名反代：/_stcore/* → ui，/api/* → api
 requirements.txt      运行依赖（已按当前环境锁定版本）
 requirements-dev.txt  测试 / 静态检查（pytest · ruff · coverage）
 pyproject.toml        pytest / ruff / coverage 配置
-tests/                pytest 用例（131）
-docs/ARCHITECTURE.md  架构分析与迭代路线图
+tests/                pytest 用例（191）
+docs/AI_PULSE_技术文档.md  唯一技术文档（架构 / 验证 / 修复记录）
+docs/AI_PULSE_小白版.md    面向非技术读者的说明
 ```
 
 ## 后续可选方向
@@ -402,4 +421,4 @@ docs/ARCHITECTURE.md  架构分析与迭代路线图
 - **UI 登录与多用户**：接入 OIDC 或反向代理 Basic Auth，把 `reviewed_by` 与真实账号绑定（API Token 已完成）。
 - **调度托管化**：把常驻 APScheduler 换成受管 cron / 云函数，减少单机依赖。
 - **召回升级**：接入真实 embedding 模型或混合检索（BM25 + 向量），提升中文同义召回。
-- **运营看板**：基于 `run_logs` / `llm_calls` 聚合 Critic 一次通过率、误报率、单 run 成本曲线。
+- **运营看板**：运行指标层（成功率 / 降级率 / P50·P95 / 打回次数）已完成；阈值告警、误报率趋势与单 run 成本曲线可继续叠加。

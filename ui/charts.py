@@ -139,3 +139,53 @@ def build_sentiment_chart(df: pd.DataFrame) -> go.Figure:
         ),
     )
     return fig
+
+
+def build_duration_chart(rows: list[dict]) -> go.Figure:
+    """最近几次 run 的耗时柱状图：降级轮次用琥珀色标出，便于一眼看出退化。"""
+    labels = [row.get("label") or "-" for row in rows]
+    durations = [round(int(row.get("duration_ms") or 0) / 1000, 1) for row in rows]
+    colors = [
+        "rgba(248, 113, 113, .85)" if row.get("degraded") else "rgba(124, 92, 255, .85)"
+        for row in rows
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=labels,
+            y=durations,
+            marker=dict(color=colors, line=dict(width=0)),
+            hovertemplate="<b>%{x}</b><br>耗时 %{y}s<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=240,
+        margin=dict(l=8, r=14, t=18, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=PLOTLY_FONT, color=MUTED, size=12),
+        bargap=0.42,
+        showlegend=False,
+        hoverlabel=dict(
+            bgcolor="#131A2A",
+            bordercolor="rgba(124, 92, 255, .4)",
+            font=dict(color="#E6E8F0", family=PLOTLY_FONT),
+        ),
+        xaxis=dict(
+            type="category",
+            showgrid=False,
+            linecolor="rgba(255,255,255,.08)",
+            tickfont=dict(color=MUTED, size=11),
+            fixedrange=True,
+        ),
+        yaxis=dict(
+            title=dict(text="秒", font=dict(color=MUTED, size=11)),
+            showgrid=True,
+            gridcolor="rgba(255,255,255,.06)",
+            zeroline=False,
+            tickfont=dict(color=MUTED, size=11),
+            fixedrange=True,
+        ),
+    )
+    return fig

@@ -114,6 +114,31 @@ def compute_heat(items: list[dict]) -> int:
     return max(800, min(2000, heat))
 
 
+# 一次分析至少喂给 Agent 的资讯条数。
+# Critic 契约要求 top_news ≥3 条、可核验标题 ≥3 条，只给 1-2 条新资讯时
+# 模型无论怎么写都无法满足，只会白跑 3 次打回再降级（实测单条批次通过率 0%）。
+MIN_ANALYSIS_ITEMS = 5
+
+
+def pad_analysis_items(
+    fresh: list[dict],
+    archived: list[dict],
+    floor: int = MIN_ANALYSIS_ITEMS,
+) -> list[dict]:
+    """新增资讯不足 floor 条时，用最近存档补齐（按标题去重，保持原顺序）。"""
+    merged = list(fresh)
+    seen = {str(item.get("title") or "") for item in merged}
+    for item in archived:
+        if len(merged) >= floor:
+            break
+        title = str(item.get("title") or "")
+        if not title or title in seen:
+            continue
+        merged.append(item)
+        seen.add(title)
+    return merged
+
+
 def compute_positive_ratio(items: list[dict]) -> int | None:
     """按抓取/Agent 情感统计正面占比，用于校正模型的 positive_ratio。"""
     if not items:
@@ -291,6 +316,9 @@ def run(
     log=print,
 ) -> RunResult:
     log = _tee_log(log)
+    # 幂等自举：pipeline 可能被 API / 调度器 / 脚本单独调用，
+    # 不能假设调用方已经建过表，否则全新库上会直接撞 no such table。
+    database.init_db()
     with run_lock(keyword, trigger, log=log):
         return _run_once(keyword, sources, trigger, log)
 
@@ -312,7 +340,12 @@ def _run_once(
 
     try:
         log(f"Agent 正在从 {len(sources)} 个数据源抓取最新资讯...")
-        items = fetcher.fetch_all(sources, keyword, per_source=10, log=log)
+        fetch_stats: dict = {}
+        fetch_started = time.perf_counter()
+        items = fetcher.fetch_all(
+            sources, keyword, per_source=10, log=log, stats=fetch_stats
+        )
+        fetch_ms = int((time.perf_counter() - fetch_started) * 1000)
         fresh = database.filter_unseen(items)
         inserted = database.save_items(items)
         log(f"数据清洗完成，过滤 {max(len(items) - inserted, 0)} 条重复/冗余数据。")
@@ -327,6 +360,17 @@ def _run_once(
             analysis_items = df.to_dict("records") if not df.empty else []
             if not analysis_items:
                 analysis_items = items
+
+        if len(analysis_items) < MIN_ANALYSIS_ITEMS:
+            df = database.fetch_recent(days=3, keyword=keyword)
+            archived = df.to_dict("records") if not df.empty else []
+            padded = pad_analysis_items(analysis_items, archived)
+            if len(padded) > len(analysis_items):
+                log(
+                    f"[INCR] 新增仅 {len(fresh)} 条，补入最近存档至 {len(padded)} 条一起分析"
+                    f"（保证 top_news 契约可满足）"
+                )
+                analysis_items = padded
 
         if rag_store.available() and rag_store.count() == 0:
             rag_store.backfill(days=7, log=log)
@@ -428,6 +472,11 @@ def _run_once(
             inserted=inserted,
             mode=analysis["_mode"],
             duration_ms=duration_ms,
+            sources_ok=int(fetch_stats.get("sources_ok", 0)),
+            sources_total=int(fetch_stats.get("sources_total", len(sources))),
+            rejections=int(analysis.get("_rejections", 0)),
+            degraded=1 if analysis["_mode"] == "fallback" else 0,
+            fetch_ms=fetch_ms,
         )
         return RunResult(
             run_id=run_id,

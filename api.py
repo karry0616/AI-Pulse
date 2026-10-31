@@ -509,6 +509,20 @@ def create_server(host: str = HOST, port: int = PORT) -> PulseServer:
     return PulseServer((host, port), APIHandler)
 
 
+def bootstrap_db() -> str | None:
+    """初始化数据库；失败时返回原因串而不是抛出。
+
+    数据库不可用（路径不可写、磁盘满、文件被占用）时服务仍要起来：
+    /api/health 会返回 503 并带上原因，容器探针与外部监控才有信号可看。
+    直接退出进程会让「为什么挂了」变成一个只能翻日志的谜。
+    """
+    try:
+        database.init_db()
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI Pulse HTTP API")
     parser.add_argument("--host", default=os.getenv("API_HOST", HOST))
@@ -516,9 +530,15 @@ def main() -> int:
     args = parser.parse_args()
 
     config.load_env()
-    database.init_db()
-
     logging_setup.setup()
+
+    failure = bootstrap_db()
+    if failure:
+        _log(f"[WARN] 数据库初始化失败，服务以降级模式启动：{failure}")
+        _log("[WARN] /api/health 将返回 503，其余接口会陆续报 500，请先修复数据库")
+    else:
+        _log(f"[API] 数据库就绪：{database.db_path()}")
+
     server = create_server(args.host, args.port)
     base = f"http://{args.host}:{args.port}"
     _log(f"[API] 服务已启动：{base}")

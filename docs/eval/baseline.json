@@ -1,0 +1,274 @@
+{
+  "generated_at": "2026-10-30T22:36:23",
+  "keyword": "AI Agent",
+  "corpus_size": 18,
+  "batch_size": 6,
+  "summary": {
+    "A": {
+      "samples": 3,
+      "contract_pass_rate": 100.0,
+      "avg_verified_ratio": 1.0,
+      "hallucination_rate": 0.0,
+      "avg_alert_error": 0.0,
+      "avg_latency_ms": 0,
+      "total_tokens": 0,
+      "avg_attempts": 1.0,
+      "degraded_rate": 0.0
+    },
+    "B": {
+      "samples": 3,
+      "contract_pass_rate": 100.0,
+      "avg_verified_ratio": 1.0,
+      "hallucination_rate": 0.0,
+      "avg_alert_error": 1.0,
+      "avg_latency_ms": 4192,
+      "total_tokens": 3279,
+      "avg_attempts": 1.0,
+      "degraded_rate": 0.0
+    },
+    "C": {
+      "samples": 3,
+      "contract_pass_rate": 100.0,
+      "avg_verified_ratio": 1.0,
+      "hallucination_rate": 0.0,
+      "avg_alert_error": 0.67,
+      "avg_latency_ms": 6637,
+      "total_tokens": 6417,
+      "avg_attempts": 1.0,
+      "degraded_rate": 0.0
+    }
+  },
+  "samples": {
+    "A": [
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 4,
+        "verified_bullets": 4,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 1,
+        "total_tokens": 0,
+        "calls": 0,
+        "attempts": 1,
+        "batch": 1,
+        "items": 6,
+        "titles": [
+          "AI+垂类Agent：任务跑得久、工具用得熟，撑不起Agent公司长期竞争力｜贝联珠贯创始人兼CEO 毕玄分享",
+          "Chainguard 推出面向 AI 编码智能体的安全工作区与安全校验能力",
+          "谷歌推出 EnvHarness，支持自进化智能体动态环境学习",
+          "DoorDash said it’s only received ‘several hundred’ orders from AI agents",
+          "Show HN: Arsaze – Cursor for video editing (Tab-complete and agent edits)",
+          "Show HN: HiveOS – Multi-agent enterprise OS with PII pills and 3-model consensus"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 4,
+        "verified_bullets": 4,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 0,
+        "total_tokens": 0,
+        "calls": 0,
+        "attempts": 1,
+        "batch": 2,
+        "items": 6,
+        "titles": [
+          "Show HN: Send21 – Crypto pay links an AI agent can create but can't spend",
+          "Last night an AI agent performed surgery on a mouse",
+          "An attack against an LLM agent is either detected or proven",
+          "Agent Memory Challenge Cycle 2 Closes in 2 Days:Text, Code and Multimodal Tracks",
+          "Show HN: SpecDeck – Bring coding agent decisions back into the spec",
+          "Local agent with multivendors, free, you own your context"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 4,
+        "verified_bullets": 4,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 0,
+        "total_tokens": 0,
+        "calls": 0,
+        "attempts": 1,
+        "batch": 3,
+        "items": 6,
+        "titles": [
+          "Some Observations on Agent Coordination",
+          "Show HN: Claude Code guards built from my agent's repeated mistakes",
+          "36氪首发丨前华为VP创业做AI原生电力资产运营，获宁德时代旗下基金数千万美元A轮融资",
+          "美银建议客户不要与 AI 助手共享银行账号密码",
+          "Wabi, the AI agent that builds mini apps, now valued at $1.25B after latest round",
+          "奥特曼和Dario同台唱rap！Genspark新视频Agent上线，零基础也能拍短剧"
+        ]
+      }
+    ],
+    "B": [
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 4041,
+        "total_tokens": 1090,
+        "calls": 1,
+        "attempts": 1,
+        "degraded": false,
+        "batch": 1,
+        "items": 6,
+        "titles": [
+          "AI+垂类Agent：任务跑得久、工具用得熟，撑不起Agent公司长期竞争力｜贝联珠贯创始人兼CEO 毕玄分享",
+          "Chainguard 推出面向 AI 编码智能体的安全工作区与安全校验能力",
+          "谷歌推出 EnvHarness，支持自进化智能体动态环境学习",
+          "DoorDash said it’s only received ‘several hundred’ orders from AI agents",
+          "Show HN: Arsaze – Cursor for video editing (Tab-complete and agent edits)",
+          "Show HN: HiveOS – Multi-agent enterprise OS with PII pills and 3-model consensus"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 4071,
+        "total_tokens": 1070,
+        "calls": 1,
+        "attempts": 1,
+        "degraded": false,
+        "batch": 2,
+        "items": 6,
+        "titles": [
+          "Show HN: Send21 – Crypto pay links an AI agent can create but can't spend",
+          "Last night an AI agent performed surgery on a mouse",
+          "An attack against an LLM agent is either detected or proven",
+          "Agent Memory Challenge Cycle 2 Closes in 2 Days:Text, Code and Multimodal Tracks",
+          "Show HN: SpecDeck – Bring coding agent decisions back into the spec",
+          "Local agent with multivendors, free, you own your context"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 4463,
+        "total_tokens": 1119,
+        "calls": 1,
+        "attempts": 1,
+        "degraded": false,
+        "batch": 3,
+        "items": 6,
+        "titles": [
+          "Some Observations on Agent Coordination",
+          "Show HN: Claude Code guards built from my agent's repeated mistakes",
+          "36氪首发丨前华为VP创业做AI原生电力资产运营，获宁德时代旗下基金数千万美元A轮融资",
+          "美银建议客户不要与 AI 助手共享银行账号密码",
+          "Wabi, the AI agent that builds mini apps, now valued at $1.25B after latest round",
+          "奥特曼和Dario同台唱rap！Genspark新视频Agent上线，零基础也能拍短剧"
+        ]
+      }
+    ],
+    "C": [
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 0,
+        "latency_ms": 6499,
+        "total_tokens": 2182,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "batch": 1,
+        "items": 6,
+        "titles": [
+          "AI+垂类Agent：任务跑得久、工具用得熟，撑不起Agent公司长期竞争力｜贝联珠贯创始人兼CEO 毕玄分享",
+          "Chainguard 推出面向 AI 编码智能体的安全工作区与安全校验能力",
+          "谷歌推出 EnvHarness，支持自进化智能体动态环境学习",
+          "DoorDash said it’s only received ‘several hundred’ orders from AI agents",
+          "Show HN: Arsaze – Cursor for video editing (Tab-complete and agent edits)",
+          "Show HN: HiveOS – Multi-agent enterprise OS with PII pills and 3-model consensus"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 6917,
+        "total_tokens": 2077,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "batch": 2,
+        "items": 6,
+        "titles": [
+          "Show HN: Send21 – Crypto pay links an AI agent can create but can't spend",
+          "Last night an AI agent performed surgery on a mouse",
+          "An attack against an LLM agent is either detected or proven",
+          "Agent Memory Challenge Cycle 2 Closes in 2 Days:Text, Code and Multimodal Tracks",
+          "Show HN: SpecDeck – Bring coding agent decisions back into the spec",
+          "Local agent with multivendors, free, you own your context"
+        ]
+      },
+      {
+        "contract_pass": true,
+        "issues": [],
+        "bullets": 5,
+        "verified_bullets": 5,
+        "verified_ratio": 1.0,
+        "hallucinated": 0,
+        "lexicon_negative": 0,
+        "alert_error": 1,
+        "latency_ms": 6495,
+        "total_tokens": 2158,
+        "calls": 2,
+        "attempts": 1,
+        "rejections": 0,
+        "degraded": false,
+        "batch": 3,
+        "items": 6,
+        "titles": [
+          "Some Observations on Agent Coordination",
+          "Show HN: Claude Code guards built from my agent's repeated mistakes",
+          "36氪首发丨前华为VP创业做AI原生电力资产运营，获宁德时代旗下基金数千万美元A轮融资",
+          "美银建议客户不要与 AI 助手共享银行账号密码",
+          "Wabi, the AI agent that builds mini apps, now valued at $1.25B after latest round",
+          "奥特曼和Dario同台唱rap！Genspark新视频Agent上线，零基础也能拍短剧"
+        ]
+      }
+    ]
+  }
+}

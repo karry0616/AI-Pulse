@@ -149,6 +149,8 @@ def finalize(state: AgentState) -> dict:
         "_degraded": state.degraded,
         "_passed": state.passed,
         "_issues": list(last_issues),
+        # 打回次数（不含审核通过的那一轮），供运行指标统计
+        "_rejections": sum(1 for issues in state.critique_history if issues),
         "_events": len(state.events),
         "_events_detail": [
             {

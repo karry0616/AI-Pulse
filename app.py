@@ -16,6 +16,7 @@ import streamlit as st
 
 import config
 import database
+import metrics
 import notify
 import pipeline
 from sources import DATA_SOURCES, KEYWORDS
@@ -81,6 +82,16 @@ def cached_recent_alerts(limit: int, keyword: str) -> list[dict]:
 @st.cache_data(ttl=30, show_spinner=False)
 def cached_latest_alert(run_id: str) -> dict | None:
     return database.latest_alert(run_id)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_run_metrics(days: int, keyword: str) -> dict:
+    return metrics.summary(days=days, keyword=keyword)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_run_series(limit: int) -> list[dict]:
+    return metrics.series(limit=limit)
 
 
 def section(title: str, caption: str) -> None:
@@ -405,7 +416,59 @@ with chart_right:
             )
 
 # ---------------------------------------------------------------------------
-# 9. 下部：情报分析与风险预警（7 : 3）
+# 9. 运行指标：把「跑得怎么样」变成可看的数字，而不是只看日志
+# ---------------------------------------------------------------------------
+run_metrics = cached_run_metrics(30, keyword)
+
+
+def _fmt(value, suffix: str = "") -> str:
+    return "—" if value is None else f"{value}{suffix}"
+
+
+section(
+    "运行指标",
+    f"近 30 天 · {run_metrics['runs']} 次运行 · 降级与打回都可追溯",
+)
+
+m1, m2, m3, m4 = st.columns(4, gap="medium")
+with m1:
+    with st.container(border=True):
+        st.metric("运行成功率", _fmt(run_metrics["success_rate"], "%"))
+        st.caption(f"共 {run_metrics['runs']} 次 · 失败自动落 failed")
+with m2:
+    with st.container(border=True):
+        st.metric("规则降级占比", _fmt(run_metrics["degraded_rate"], "%"))
+        st.caption("未走模型 / API 失败 / 契约未通过")
+with m3:
+    with st.container(border=True):
+        st.metric("抓取成功率", _fmt(run_metrics["fetch_ok_ratio"], "%"))
+        st.caption("成功返回的源 / 参与抓取的源")
+with m4:
+    with st.container(border=True):
+        st.metric("P95 全链路耗时", _fmt(run_metrics["p95_ms"], " ms"))
+        st.caption(
+            f"P50 {_fmt(run_metrics['p50_ms'], ' ms')} · "
+            f"抓取均值 {_fmt(run_metrics['avg_fetch_ms'], ' ms')} · "
+            f"平均打回 {_fmt(run_metrics['rejections_per_run'], ' 次')}"
+        )
+
+duration_rows = cached_run_series(limit=20)
+if duration_rows:
+    with st.container(border=True):
+        st.markdown(
+            '<div class="chart-title">最近运行耗时 <span>红色为规则降级轮次</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(
+            charts.build_duration_chart(duration_rows),
+            width="stretch",
+            config={"displayModeBar": False},
+        )
+else:
+    st.caption("暂无运行记录，完成一次情报更新后这里会出现耗时与降级趋势")
+
+# ---------------------------------------------------------------------------
+# 10. 下部：情报分析与风险预警（7 : 3）
 # ---------------------------------------------------------------------------
 section(
     "情报分析与预警",
@@ -557,7 +620,7 @@ if approval_history:
             )
 
 # ---------------------------------------------------------------------------
-# 10. 底部：数据流转面板（终端黑框）
+# 11. 底部：数据流转面板（终端黑框）
 # ---------------------------------------------------------------------------
 section("数据流转日志", "pulse-agent · pipeline.log")
 

@@ -42,6 +42,23 @@ def run(
     for attempt in range(1, MAX_ATTEMPTS + 1):
         state.attempts = attempt
         state.draft = analyst.run(state, log)
+
+        # 规则模式的输出是确定性的：同样的输入重跑只会得到同一份草稿，
+        # 再打回 3 次也不会变好。这里只做一次契约校验并记录真实问题，
+        # 避免「每次降级都必然白跑 3 轮」。
+        if state.mode == "fallback":
+            state.critique = critic.check_contract(state.draft, state)
+            state.critique_history.append(list(state.critique))
+            state.passed = not state.critique
+            if state.critique:
+                log(
+                    "[REFLEXION] 规则模式输出，跳过重试："
+                    + "；".join(state.critique[:3])
+                )
+            else:
+                log("[AGENT] 规则模式输出通过契约校验")
+            break
+
         issues = critic.check_contract(state.draft, state)
 
         if not issues:
@@ -59,6 +76,9 @@ def run(
         log("[REFLEXION] 达到最大重试次数，切换规则降级")
         state.draft = analyst.fallback(state, "Critic 连续 3 次未通过", log)
         state.passed = False
+        # 兜底草稿同样记录一次契约结果，便于指标统计「打回后仍不合规」
+        state.critique = critic.check_contract(state.draft, state)
+        state.critique_history.append(list(state.critique))
 
     analysis = critic.finalize(state)
     log(
