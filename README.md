@@ -139,7 +139,7 @@ flowchart LR
 8. **Prompt 注入防护**：所有外部文本（今日资讯与历史记忆）都用 `<<<UNTRUSTED_DATA>>>` 边界包裹，并屏蔽"忽略以上指令"类注入句式，模型无法伪造闭合标记。
 9. **可运维**：日志双写 `logs/pulse.log`（2MB × 3 轮转）；`database.py --stats / --archive-days` 做容量统计与冷热归档；Dockerfile + compose + Caddyfile 一键容器化。
 10. **配置收敛**：数据源、关键词、别名只在 `sources.py` 注册一次，UI / 调度器 / API / fetcher 全部从这里取值。
-11. **可观测性不止日志**：`metrics.py` 从 `run_logs` 反查运行成功率、规则降级占比、抓取成功率、P50/P95 耗时与平均打回次数，页面「运行指标」区块与 CLI 共用同一口径。
+11. **可观测性不止日志**：`metrics.py` 从 `run_logs` 反查运行成功率、规则降级占比、抓取成功率、P50/P95 耗时与平均打回次数，页面「运行指标」区块与 CLI 共用同一口径；耗时与条数只统计有效 run（排除断网日与「0 条归档回退」的假成功）。
 12. **有对照组的方案验证**：`eval/baseline.py` 在同一语料、同一弱标签下对比「规则模板 / 单次 LLM / 三 Agent / 补档后三 Agent」，用量化指标说明三 Agent 的收益与代价，而不是自证有效。
 
 ## 功能清单（P0–P3）
@@ -307,12 +307,14 @@ docker compose --profile https up -d caddy
 
 ```powershell
 .\.venv\Scripts\python.exe database.py --stats                     # 各表容量
+.\.venv\Scripts\python.exe database.py --backup                    # 在线备份到 backups/（保留最近 7 份）
 .\.venv\Scripts\python.exe database.py --archive-days 90 --dry-run # 归档演练（只统计）
 .\.venv\Scripts\python.exe database.py --archive-days 90           # 冷热分离并清理热表
 Get-Content logs\pulse.log -Tail 50                                # 最近日志
 ```
 
 - **日志**：`logs/pulse.log`，2MB 轮转、保留 3 份；UI 面板与文件同时写入，API 路径已去重不会重复落盘。
+- **备份**：`database.py --backup` 走 SQLite 在线备份 API（WAL 下不会漏写），`backups/` 默认保留最近 7 份；Windows 任务计划「AI Pulse Backup」每天 08:30 自动执行一次。
 - **冷热归档**：超过 90 天的 `daily_intel` / `llm_calls` 搬入 `*_archive` 表，热表保持轻量。
 - **分析快照**：每次 run 的结果存 `analyses`，刷新页面自动回放。
 - **运行锁**：`.pulse.lock` 残留超过 30 分钟会被下一次 run 抢占，异常退出不会永久卡死。

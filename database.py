@@ -10,7 +10,7 @@ import json
 import os
 import sqlite3
 import sys
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -1111,6 +1111,32 @@ def storage_stats() -> dict:
         }
 
 
+BACKUP_DIR = _ROOT / "backups"
+BACKUP_KEEP = 7
+
+
+def backup_db(keep: int = BACKUP_KEEP, directory: Path | None = None) -> Path | None:
+    """在线备份数据库并只保留最近 keep 份；库不存在时返回 None。
+
+    WAL 模式下直接复制 .db 文件会漏掉尚未检查点的 -wal 内容，
+    因此走 sqlite3 的 backup API：它在事务边界拷贝，可与调度器写入共存。
+    """
+    source = db_path()
+    if not source.exists():
+        return None
+
+    target_dir = Path(directory) if directory else BACKUP_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"pulse-{datetime.now():%Y%m%d-%H%M%S-%f}.db"
+    with closing(sqlite3.connect(source)) as src, closing(sqlite3.connect(target)) as dst:
+        src.backup(dst)
+
+    if keep > 0:
+        for old in sorted(target_dir.glob("pulse-*.db"))[:-keep]:
+            old.unlink(missing_ok=True)
+    return target
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="AI Pulse 数据维护")
     parser.add_argument(
@@ -1119,7 +1145,14 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="只统计，不执行归档")
     parser.add_argument("--stats", action="store_true", help="查看各表行数")
+    parser.add_argument("--backup", action="store_true", help="在线备份数据库并轮转旧备份")
+    parser.add_argument("--keep", type=int, default=BACKUP_KEEP, help="备份保留份数（默认 7）")
     args = parser.parse_args()
+
+    if args.backup:
+        path = backup_db(keep=args.keep)
+        print(json.dumps({"backup": str(path) if path else None}, ensure_ascii=False))
+        return 0
 
     init_db()
     if args.stats:

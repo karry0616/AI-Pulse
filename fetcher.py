@@ -112,8 +112,10 @@ def fetch_source(
         return None
 
     feed = feedparser.parse(resp.content)
-    if not feed.entries:
-        log(f"[WARN] {name} RSS 解析失败（无有效条目）")
+    # 合法 feed 也可能当期没有条目（如 arXiv 周末 skipDays），这属于「成功、0 条」，
+    # 不该记成抓取失败；只有解析结果根本不是 feed（version 为空）才算坏源。
+    if not feed.entries and not feed.version:
+        log(f"[WARN] {name} RSS 解析失败（不是有效的 feed）")
         return None
 
     items: list[dict] = []

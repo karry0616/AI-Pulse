@@ -80,6 +80,7 @@ Copy-Item .env.example .env    # 填 DEEPSEEK_API_KEY / WEBHOOK_URL
 | 事件线 / 运行指标 JSON | `.\.venv\Scripts\python.exe events.py --keyword "AI Agent"` / `.\.venv\Scripts\python.exe metrics.py --days 30 --keyword "AI Agent"` |
 | 方案对比实验 | `.\.venv\Scripts\python.exe eval\baseline.py --limits 18 --batch 6` |
 | 各表容量 / 归档演练 | `.\.venv\Scripts\python.exe database.py --stats` / `.\.venv\Scripts\python.exe database.py --archive-days 90 --dry-run` |
+| 数据库备份 | `.\.venv\Scripts\python.exe database.py --backup`（在线备份，保留最近 7 份） |
 | 测试 / 静态检查 | `.\.venv\Scripts\python.exe -m pytest -q` / `.\.venv\Scripts\ruff.exe check .` |
 
 ### 2.3 环境变量
@@ -511,14 +512,17 @@ SQLite（WAL）共 9 张表，`PRAGMA user_version` 记录迁移版本（当前 
 | 指标 | 口径 |
 | --- | --- |
 | 运行成功率 / 规则降级占比 | `status=success` 行数 / 窗口内总行数；`degraded=1` 行数 / 总数 |
-| 抓取成功率 | `sum(sources_ok) / sum(sources_total)` |
-| P50 / P95 全链路耗时 | 对 `duration_ms` 取分位数（测试覆盖分位数语义与空窗口） |
-| 平均抓取耗时 / 平均打回次数 | `avg(fetch_ms)`；`avg(rejections)`（Critic 一次通过率的反向口径） |
-| 最近 20 次耗时序列 | 只取 `success` 轮次，降级轮次在图中标红 |
+| 抓取成功率 | `sum(sources_ok) / sum(sources_total)`（按全部成功 run，断网日必须把比例拉下来） |
+| 有效 / 排除轮次 | 有效 run = `success` 且 `items > 0`，且非断网（`sources_total=0` 的 v5 前老行无法判定，按有效处理）；排除轮次 = 成功但断网（`sources_ok=0`）或抓到 0 条后回退存档 |
+| P50 / P95 全链路耗时 | 对**有效 run** 的 `duration_ms` 取分位数；假成功轮次不计入 |
+| 平均抓取耗时 / 平均打回次数 | 抓取均值只取有效 run；打回次数按全部成功 run |
+| 最近 20 次耗时序列 | 只取**有效 run**，断网日与归档回退的假成功不再压出虚假低谷 |
+
+> 为什么要分层：断网日没有网络等待、归档回退也不调用模型，这两类轮次耗时反而更短，却都以 `status=success` 落库。若直接混入分位数，P50/P95 与平均条数会被系统性拉低（实测 2026-10-31 的 RAG 轮次仅 6.7s、0 条，而同轮有效 run 为 9–21s）。
 
 ### 11.3 页面与 CLI
 
-`app.py` 第 9 区块「运行指标」有 4 张卡片 + 最近 20 次耗时柱状图（降级轮次红色）；CLI 用 `metrics.py --days 30 --keyword "AI Agent"` 输出 JSON；日志落 `logs/pulse.log`，`[LOCK]` / `[COST]` / `[GUARD]` / `[REFLEXION]` 前缀便于检索。
+`app.py` 第 9 区块「运行指标」有 4 张卡片 + 最近 20 次耗时柱状图（降级轮次红色），成功率卡片下方显示「共 N 次 · 有效 M 次 · 排除 K 次」；CLI 用 `metrics.py --days 30 --keyword "AI Agent"` 输出 JSON；日志落 `logs/pulse.log`，`[LOCK]` / `[COST]` / `[GUARD]` / `[REFLEXION]` 前缀便于检索。
 
 ### 11.4 运营 KPI 现状
 
@@ -796,7 +800,7 @@ CI：`.github/workflows/ci.yml`（ruff + coverage + pytest，只装测试依赖�
 
 ### 16.3 数据运维
 
-`database.py` 三个入口：`--stats` 各表容量、`--archive-days 90 --dry-run` 归档演练（只统计）、`--archive-days 90` 冷热分离并清理热表。冷热归档把超过 90 天的 `daily_intel` / `llm_calls` 搬入 `*_archive`；每次 run 的结果存 `analyses`，刷新页面自动回放；`--status` 返回示例「未运行 · 启动标记：已禁用」。
+`database.py` 四个入口：`--stats` 各表容量、`--archive-days 90 --dry-run` 归档演练（只统计）、`--archive-days 90` 冷热分离并清理热表、`--backup` 在线备份（SQLite backup API，WAL 下不会漏写，`backups/` 保留最近 7 份，Windows 任务计划「AI Pulse Backup」每天 08:30 执行）。冷热归档把超过 90 天的 `daily_intel` / `llm_calls` 搬入 `*_archive`；每次 run 的结果存 `analyses`，刷新页面自动回放；`--status` 返回示例「未运行 · 启动标记：已禁用」。
 
 ### 16.4 日志与健康检查
 

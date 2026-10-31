@@ -183,6 +183,40 @@ def test_demo_alerts_can_be_filtered_from_history():
     assert database.get_alert(demo)["is_demo"] == 1
 
 
+def test_backup_db_copies_current_data(tmp_path):
+    database.save_items([make_item("备份测试")])
+    target = tmp_path / "backups"
+
+    path = database.backup_db(directory=target)
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM daily_intel").fetchone()[0] == 1
+
+
+def test_backup_db_rotates_old_files(tmp_path):
+    target = tmp_path / "backups"
+    target.mkdir()
+    for name in (
+        "pulse-20260101-000000-000000.db",
+        "pulse-20260102-000000-000000.db",
+        "pulse-20260103-000000-000000.db",
+    ):
+        (target / name).write_bytes(b"old")
+
+    path = database.backup_db(keep=2, directory=target)
+
+    backups = sorted(target.glob("pulse-*.db"))
+    assert len(backups) == 2
+    assert backups[-1] == path
+
+
+def test_backup_db_returns_none_without_database(tmp_path, monkeypatch):
+    missing = tmp_path / "missing.db"
+    monkeypatch.setattr(database, "DB_PATH", missing)
+
+    assert database.backup_db(directory=tmp_path / "backups") is None
+
+
 def test_health_reports_database_ready():
     health = database.health()
     assert health["ok"] is True

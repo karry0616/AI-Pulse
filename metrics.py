@@ -45,6 +45,22 @@ def _window(days: int) -> str:
     return (date.today() - timedelta(days=max(days - 1, 0))).isoformat()
 
 
+def _usable(row: dict) -> bool:
+    """该 run 能否进入耗时与条数统计。
+
+    断网日（sources_ok=0）和「抓到 0 条、回退最近存档」的 run 都会以
+    status="success" 落库，但它们的耗时反而更短、条数为 0，混进分位数会把
+    指标刷得虚好看。因此只统计「既有成功抓取、又有真实新资讯」的 run。
+
+    sources_total=0 的是 schema v5 之前的老行（当时还没有抓取统计），
+    无法判断是否断网，只要 items>0 就照常计入，避免历史数据被误伤。
+    """
+    if row.get("status") != "success" or int(row.get("items") or 0) <= 0:
+        return False
+    total = int(row.get("sources_total") or 0)
+    return total == 0 or int(row.get("sources_ok") or 0) > 0
+
+
 def recent_run_rows(days: int = DEFAULT_WINDOW_DAYS, limit: int = 200) -> list[dict]:
     """窗口内最近的运行记录（按开始时间倒序）。"""
     since = _window(days)
@@ -65,9 +81,13 @@ def recent_run_rows(days: int = DEFAULT_WINDOW_DAYS, limit: int = 200) -> list[d
 
 
 def series(limit: int = 20) -> list[dict]:
-    """最近 N 次成功 run 的耗时段，供页面画趋势。"""
+    """最近 N 次有效 run 的耗时段，供页面画趋势。
+
+    只取既有成功抓取、又有真实新资讯的 run，避免断网日或归档回退的
+    「假成功」把趋势线压出一个虚假的低谷。
+    """
     rows = recent_run_rows(days=90, limit=limit * 3)
-    done = [row for row in rows if row["status"] == "success"]
+    done = [row for row in rows if _usable(row)]
     done = list(reversed(done[:limit]))
     return [
         {
@@ -90,6 +110,8 @@ def summary(days: int = DEFAULT_WINDOW_DAYS, keyword: str | None = None) -> dict
         return {
             "window_days": days,
             "runs": 0,
+            "usable_runs": 0,
+            "excluded_runs": 0,
             "success_rate": None,
             "degraded_rate": None,
             "fetch_ok_ratio": None,
@@ -102,8 +124,10 @@ def summary(days: int = DEFAULT_WINDOW_DAYS, keyword: str | None = None) -> dict
         }
 
     done = [row for row in rows if row["status"] == "success"]
-    durations = [int(row.get("duration_ms") or 0) for row in done if row.get("duration_ms")]
-    fetch_durations = [int(row.get("fetch_ms") or 0) for row in done if row.get("fetch_ms")]
+    usable = [row for row in rows if _usable(row)]
+    durations = [int(row.get("duration_ms") or 0) for row in usable if row.get("duration_ms")]
+    fetch_durations = [int(row.get("fetch_ms") or 0) for row in usable if row.get("fetch_ms")]
+    # 抓取成功率按全部成功 run 统计：断网日就该把比例拉下来，这是健康信号，不能排除
     sources_total = sum(int(row.get("sources_total") or 0) for row in done)
     sources_ok = sum(int(row.get("sources_ok") or 0) for row in done)
     degraded = sum(int(row.get("degraded") or 0) for row in done)
@@ -111,6 +135,8 @@ def summary(days: int = DEFAULT_WINDOW_DAYS, keyword: str | None = None) -> dict
     return {
         "window_days": days,
         "runs": len(rows),
+        "usable_runs": len(usable),
+        "excluded_runs": len(done) - len(usable),
         "success_rate": round(len(done) / len(rows) * 100, 1),
         "degraded_rate": round(degraded / len(done) * 100, 1) if done else None,
         "fetch_ok_ratio": round(sources_ok / sources_total * 100, 1) if sources_total else None,
@@ -125,8 +151,8 @@ def summary(days: int = DEFAULT_WINDOW_DAYS, keyword: str | None = None) -> dict
         "avg_fetch_ms": (
             round(sum(fetch_durations) / len(fetch_durations)) if fetch_durations else None
         ),
-        "avg_items": round(sum(int(row.get("items") or 0) for row in done) / len(done), 1)
-        if done
+        "avg_items": round(sum(int(row.get("items") or 0) for row in usable) / len(usable), 1)
+        if usable
         else None,
     }
 

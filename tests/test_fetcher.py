@@ -106,3 +106,43 @@ def test_failed_source_is_skipped_within_cooldown(monkeypatch):
     assert fetcher.fetch_all(["36Kr"], "AI Agent", log=lambda m: None) == []
     assert fetcher.fetch_all(["36Kr"], "AI Agent", log=lambda m: None) == []
     assert len(calls) == 1  # 第二轮走失败冷却，不再发请求
+
+
+def test_fetch_source_treats_empty_feed_as_success(monkeypatch):
+    """合法 feed 当期无条目（如 arXiv 周末 skipDays）应算成功，而不是坏源。"""
+    body = (
+        b'<?xml version="1.0" encoding="UTF-8"?>'
+        b'<rss version="2.0"><channel><title>arXiv</title>'
+        b"<skipDays><day>Saturday</day><day>Sunday</day></skipDays>"
+        b"</channel></rss>"
+    )
+
+    class Response:
+        content = body
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(fetcher.requests, "get", lambda *args, **kwargs: Response())
+    fetcher.clear_cache()
+
+    items = fetcher.fetch_source(
+        "arXiv", "https://x.test/empty", "AI Agent", 5, lambda message: None
+    )
+
+    assert items == []
+
+
+def test_fetch_source_rejects_non_feed_body(monkeypatch):
+    class Response:
+        content = b"<html><body>502 Bad Gateway</body></html>"
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(fetcher.requests, "get", lambda *args, **kwargs: Response())
+    fetcher.clear_cache()
+
+    items = fetcher.fetch_source("X", "https://x.test/broken", "AI Agent", 5, lambda m: None)
+
+    assert items is None

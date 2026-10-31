@@ -434,7 +434,10 @@ m1, m2, m3, m4 = st.columns(4, gap="medium")
 with m1:
     with st.container(border=True):
         st.metric("运行成功率", _fmt(run_metrics["success_rate"], "%"))
-        st.caption(f"共 {run_metrics['runs']} 次 · 失败自动落 failed")
+        st.caption(
+            f"共 {run_metrics['runs']} 次 · 有效 {run_metrics['usable_runs']} 次 · "
+            f"排除 {run_metrics['excluded_runs']} 次（断网 / 0 条）"
+        )
 with m2:
     with st.container(border=True):
         st.metric("规则降级占比", _fmt(run_metrics["degraded_rate"], "%"))
